@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -18,9 +19,25 @@ BINARIES = {
     "katana": "katana",
 }
 
+# Ferramentas Go vivem em ~/go/bin, que pode não estar no PATH herdado pelo
+# venv do pipx. Procuramos aqui como fallback (ver README da casa).
+_EXTRA_BIN_DIRS = [
+    Path.home() / "go" / "bin",
+    Path("/root/go/bin"),
+    Path("/usr/local/bin"),
+]
+
 
 def resolve_bin(name: str) -> Optional[str]:
-    return shutil.which(BINARIES.get(name, name))
+    real = BINARIES.get(name, name)
+    found = shutil.which(real)
+    if found:
+        return found
+    for d in _EXTRA_BIN_DIRS:
+        cand = d / real
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
 
 
 @dataclass

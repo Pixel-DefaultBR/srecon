@@ -10,11 +10,12 @@ from rich.markup import escape
 
 from . import config, report
 from . import scope as scopemod
+from .commands import crawl as crawl_cmd
 from .commands import host as host_cmd
 from .commands import pipeline as pipeline_cmd
 from .commands import search as search_cmd
 from .shodan_client import ShodanClient, ShodanClientError
-from .util import output_dir, slugify
+from .util import output_dir, slugify, utc_stamp
 
 app = typer.Typer(
     help="srecon — recon com Shodan para a estação srv1876073.",
@@ -259,6 +260,151 @@ def pipeline(
     console.print(f"[dim]relatório em {outdir}[/dim]")
 
 
+# -------------------------------- crawl ------------------------------------ #
+
+def _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages):
+    t = report.Table(title="crawl — resumo", box=report.box.MINIMAL_DOUBLE_HEAD)
+    t.add_column("artefato")
+    t.add_column("qtd", justify="right")
+    rows = [
+        ("registros JSONL", art.records), ("URLs", len(art.all_urls)),
+        ("JS", len(art.js)), ("endpoints c/ params", len(art.param_urls)),
+        ("param names únicos", len(art.param_names)), ("subdomínios", len(art.subdomains)),
+        ("API endpoints", len(art.api_endpoints)), ("forms", len(art.forms)),
+        ("possíveis segredos", len(art.secrets)),
+    ]
+    for name, n in rows:
+        t.add_row(name, str(n))
+    console.print(t)
+
+    if diff:
+        base = f"vs {prev_dir.name}" if prev_dir else "sem baseline (1º run)"
+        dt = report.Table(title=f"novidades ({base})", box=report.box.SIMPLE)
+        dt.add_column("categoria")
+        dt.add_column("novos", justify="right")
+        for name, items in diff.items():
+            dt.add_row(name, f"[green]+{len(items)}[/green]" if items else "0")
+        console.print(dt)
+
+    if art.secrets:
+        err.print(f"[red]⚠ {len(art.secrets)} possível(is) segredo(s)[/red] — ver secrets.txt")
+    if stages:
+        for s in stages:
+            tag = "[green]ok[/green]" if s.ran and s.returncode == 0 else f"[yellow]{escape(s.note or 'rc='+str(s.returncode))}[/yellow]"
+            console.print(f"  chain {escape(s.name)}: {tag}")
+
+
+@app.command()
+def crawl(
+    target: str = typer.Argument(..., help="IP/domínio/URL alvo do crawl."),
+    depth: int = typer.Option(3, "-d", "--depth", help="Profundidade (>=3 p/ known-files)."),
+    rate: int = typer.Option(20, "--rate", help="req/s global (katana -rl)."),
+    host_rate: int = typer.Option(10, "--host-rate", help="req/s por host (-hrl)."),
+    concurrency: int = typer.Option(5, "-c", "--concurrency", help="fetchers concorrentes (-c)."),
+    parallelism: int = typer.Option(2, "--parallelism", help="inputs paralelos (-p)."),
+    timeout_s: int = typer.Option(15, "--timeout", help="timeout por request (s)."),
+    retry: int = typer.Option(2, "--retry", help="retries por request."),
+    delay: int = typer.Option(1, "--delay", help="delay entre requests (s, -rd)."),
+    duration: str = typer.Option("30m", "--duration", help="duração máx do crawl (-ct), ex 30m/1h."),
+    field_scope: str = typer.Option("rdn", "--field-scope", help="escopo de campo do katana: rdn|fqdn|dn (-fs)."),
+    js: bool = typer.Option(True, "--js/--no-js", help="parsing de endpoints em JS (-jc)."),
+    known_files: bool = typer.Option(True, "--known-files/--no-known-files", help="known-files (-kf all)."),
+    headless: bool = typer.Option(False, "--headless", help="crawl headless (-hl -nos -sc -xhr); lento."),
+    header: Optional[list[str]] = typer.Option(None, "-H", "--header", help="header/cookie extra (repetível)."),
+    proxy: Optional[str] = typer.Option(None, "--proxy", help="proxy HTTP/SOCKS5 (-proxy)."),
+    extra: Optional[str] = typer.Option(None, "--extra", help="args katana crus (word-split)."),
+    store_responses: bool = typer.Option(True, "--store-responses/--no-store-responses", help="salvar respostas brutas."),
+    scope_file: Optional[Path] = typer.Option(None, help="Arquivo de escopo específico."),
+    i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gating."),
+    do_diff: bool = typer.Option(True, "--diff/--no-diff", help="diff vs run anterior (latest)."),
+    scan_secrets: bool = typer.Option(True, "--secrets/--no-secrets", help="varre bodies por segredos."),
+    chain: bool = typer.Option(False, "--chain", help="encadeia httpx-toolkit -> nuclei nos achados."),
+    do_httpx: bool = typer.Option(False, "--httpx", help="probe httpx-toolkit em all-urls (-> live.txt)."),
+    severity: str = typer.Option("low,medium,high,critical", help="severidades do nuclei (no --chain)."),
+    stage_timeout: int = typer.Option(1800, "--stage-timeout", help="timeout por estágio httpx/nuclei do chain (s)."),
+    dry_run: bool = typer.Option(False, help="mostra o comando do katana sem executar."),
+):
+    """Crawl ATIVO com katana: URLs/JS/params/subs + forms/segredos/API, diff vs run anterior e encadeamento (gated por scope)."""
+    if field_scope not in crawl_cmd.FIELD_SCOPES:
+        _die(f"--field-scope inválido '{field_scope}' (use rdn|fqdn|dn).")
+    if "," in target:
+        # -u do katana é lista separada por vírgula: um target com ',' viraria
+        # múltiplos seeds, dos quais só o 1º passa pelo scope-gate. Recusa.
+        _die("target não pode conter vírgula (cada host deve ser um crawl separado).", code=2)
+
+    host = crawl_cmd.extract_host(target) or target
+
+    # scope-gating: crawl é ATIVO (toca o alvo)
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+    hit = scopemod.match(host, entries)
+    if not hit and not i_am_authorized:
+        _die(
+            f"'{host}' não autorizado. Crawl é ativo e exige scope em {config.scope_dir()} "
+            "(Regra de ouro). Use --scope-file ou --i-am-authorized se tiver autorização escrita.",
+            code=3,
+        )
+    if i_am_authorized and not hit:
+        err.print("[yellow]OVERRIDE ativo (--i-am-authorized): scope-gating ignorado.[/yellow]")
+
+    katana = crawl_cmd.resolve_bin("katana")
+    if not katana:
+        _die("katana não encontrado (PATH nem ~/go/bin). Instale ou ajuste o PATH.", code=127)
+
+    opt = crawl_cmd.CrawlOptions(
+        depth=depth, rate=rate, host_rate=host_rate, concurrency=concurrency,
+        parallelism=parallelism, timeout=timeout_s, retry=retry, delay=delay,
+        duration=duration, field_scope=field_scope, js=js, known_files=known_files,
+        headless=headless, headers=header or [], proxy=proxy or "",
+        extra=crawl_cmd.split_extra(extra), store_responses=store_responses,
+    )
+
+    slug = slugify(f"crawl-{host}")
+    parent = config.reports_dir() / slug
+    prev_dir = crawl_cmd.previous_run(parent) if do_diff else None
+    run_dir = parent / utc_stamp()
+
+    seeds = crawl_cmd.build_seeds(target)
+    args = crawl_cmd.build_katana_args(katana, seeds, run_dir, opt)
+    scope_src = str(hit.source) if hit else "OVERRIDE (--i-am-authorized)"
+
+    console.print(f"[bold]katana crawl[/bold] de [cyan]{escape(target)}[/cyan] "
+                  f"(scope: {escape(scope_src)})")
+    console.print(f"[dim]{escape(' '.join(crawl_cmd.redact_args(args)))}[/dim]")
+
+    if dry_run:
+        console.print(f"[yellow]dry-run[/yellow] — nada executado (dir seria {run_dir}).")
+        return
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    crawl_cmd.write_meta(run_dir, target, seeds, katana, args, opt)
+    rc = crawl_cmd.run_katana(args)
+    if rc == 130:
+        err.print("[yellow]interrompido — processando resultados parciais.[/yellow]")
+    elif rc != 0:
+        err.print(f"[yellow]katana saiu com código {rc}; processando o capturado.[/yellow]")
+
+    art = crawl_cmd.process_jsonl(run_dir / "output.jsonl", scan_secrets)
+    crawl_cmd.write_artifacts(art, run_dir)
+    diff = crawl_cmd.compute_diff(run_dir, prev_dir) if do_diff else {}
+
+    stages = []
+    if do_httpx or chain:
+        stages = crawl_cmd.run_probe_and_chain(
+            run_dir, run_dir / "all-urls.txt", chain, severity, stage_timeout, False
+        )
+
+    crawl_cmd.update_latest(parent, run_dir)
+    _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages)
+    crawl_cmd.write_report_md(run_dir, target, art, diff, prev_dir, stages, scope_src)
+    console.print(f"[dim]relatório em {run_dir}[/dim]")
+
+
 # ------------------------------ scope-check -------------------------------- #
 
 @app.command("scope-check")
@@ -320,6 +466,12 @@ def selftest():
     checks.append(("scope reject newline",
                    scopemod.match("evil.com\ncortex.cloudwiser.com.br", [entry]) is None,
                    "gate anti-bypass"))
+    checks.append(("scope reject comma",
+                   scopemod.match("cortex.cloudwiser.com.br,evil.com", [entry]) is None,
+                   "gate anti-bypass (vírgula)"))
+    entry6 = scopemod.parse_scope_text("Autorizado 2001:db8::/32", Path("t6.txt"))
+    checks.append(("scope ipv6 cidr",
+                   scopemod.match("http://[2001:db8::5]/x", [entry6]) is not None, "ipv6"))
 
     t = report.Table(title="selftest", box=report.box.MINIMAL_DOUBLE_HEAD)
     t.add_column("check")
