@@ -27,7 +27,20 @@ srecon scope-check cortex.cloudwiser.com.br        # testa autorização (offlin
 srecon pipeline cortex.cloudwiser.com.br
 srecon pipeline --from-search 'org:"ACME"' --search-limit 30 --dry-run
 srecon pipeline 10.0.0.5 --stages httpx,nuclei --severity high,critical
+
+# crawl ativo com katana (gated por scope): URLs/JS/params/subs + forms/segredos/API + diff
+srecon crawl cortex.cloudwiser.com.br
+srecon crawl https://app.cortex.cloudwiser.com.br/ -d 4 -H 'Cookie: session=abc'
+srecon crawl cortex.cloudwiser.com.br --chain --severity high,critical   # -> httpx -> nuclei
+srecon crawl cortex.cloudwiser.com.br --dry-run
 ```
+
+## crawl — incrementos sobre o katana-auto.sh original
+- **scope-gating** (mesma Regra de ouro): crawl é ativo, recusa alvo fora de `scope/*.txt`.
+- **diff entre runs**: symlink `latest` + `diff-new-*.txt` (URLs/params/subs/API novos).
+- **extração enriquecida**: `param-names.txt` (fuzzing), `api-endpoints.txt`, `forms.txt`,
+  `secrets.txt` (regras AWS/GCP/JWT/private-key/etc, varredura nos bodies).
+- **encadeamento**: `--httpx` (probe -> `live.txt`) e `--chain` (httpx-toolkit -> nuclei).
 
 ## Scope-gating
 - Alvo precisa bater em algum `/root/audits/scope/*.txt` (domínio, wildcard `*.x` ou CIDR).
@@ -38,6 +51,9 @@ srecon pipeline 10.0.0.5 --stages httpx,nuclei --severity high,critical
 ## Saídas
 - `reports/<slug>/<YYYYMMDDTHHMMSSZ>/` — `host.json`/`.md`, `search.json`/`.csv`,
   `pipeline.md` + saídas brutas dos estágios (`httpx.jsonl`, `nuclei.jsonl`, `testssl_*.json`).
+- crawl: `reports/crawl-<host>/<stamp>/` com `output.jsonl`, `all-urls.txt`, `js.txt`,
+  `param-names.txt`, `api-endpoints.txt`, `forms.txt`, `secrets.txt`, `subdomains.txt`,
+  `diff-new-*.txt`, `crawl-report.md`, `run-meta.{txt,json}` (0600) + symlink `latest`.
 
 ## Config
 - API key: `SHODAN_API_KEY` (env) > `~/.config/srecon/config.toml` > `~/.shodan/api_key`.
