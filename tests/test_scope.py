@@ -45,6 +45,27 @@ def test_reject_comma_and_whitespace():
     assert scope.match("a.example.com\nevil.com", [e]) is None
 
 
+def test_negation_and_comment_lines_do_not_authorize():
+    # regressão do bug guloso: nota de exclusão/comentário NUNCA autoriza
+    text = ("Autorizado: prod.cliente.com\n"
+            "# comentario menciona staging.cliente.com\n"
+            "Fora de escopo (NAO TOCAR): partner.terceiro.com\n"
+            "// out of scope: 8.8.8.8\n"
+            "excluir range: 10.0.0.0/8\n")
+    e = _entry(text)
+    assert scope.match("prod.cliente.com", [e])                 # única linha de allow
+    assert scope.match("partner.terceiro.com", [e]) is None     # linha de negação
+    assert scope.match("staging.cliente.com", [e]) is None      # comentário '#'
+    assert scope.match("8.8.8.8", [e]) is None                  # comentário '//'
+    assert scope.match("10.0.0.5", [e]) is None                 # 'excluir' + CIDR
+
+
+def test_normalize_host_strips_query_and_fragment():
+    e = _entry("*.example.com")
+    assert scope.match("https://a.example.com?x=1", [e])        # '?' sem '/' antes
+    assert scope.match("https://a.example.com#frag", [e])
+
+
 def test_ipv6_address_and_cidr():
     e = _entry("Autorizado ::1 e 2001:db8::/32")
     assert scope.match("::1", [e])

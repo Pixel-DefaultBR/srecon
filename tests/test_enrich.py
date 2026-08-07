@@ -43,6 +43,33 @@ def test_find_forms():
     assert enrich.find_forms("<p>no forms here</p>") == []
 
 
+def test_extract_js_endpoints():
+    js = (
+        'const API = "https://api.example.com/v2/users";'
+        'fetch("/api/v1/orders?id=1");'
+        'const r = /\\/foo\\/(\\d+)/;'                 # regex — deve ser ignorado
+        'var css = "//cdn.host/x";'                    # protocol-relative — ignorado
+        'load("/static/app.js");'
+        'const t = `/tpl/${id}/x`;'                    # template com ${} — ruído, ignorado
+        'x("not a path");'                             # sem barra inicial — ignorado
+    )
+    eps = enrich.extract_js_endpoints(js)
+    assert "https://api.example.com/v2/users" in eps
+    assert "/api/v1/orders?id=1" in eps
+    assert "/static/app.js" in eps
+    assert not any("//cdn" in e for e in eps)
+    assert not any("${" in e for e in eps)
+    assert not any(c in "".join(eps) for c in "()\\")
+
+
+def test_extract_js_params():
+    js = 'fetch("/api/search?q=x&page=2&sort_by=date");' 'go("/a?id=1");' 'noise("/b?=&x")'
+    params = enrich.extract_js_params(js)
+    assert {"q", "page", "sort_by", "id"}.issubset(params)
+    assert "" not in params
+    assert enrich.extract_js_params("var x = 1;") == set()
+
+
 def test_scan_secrets():
     text = ('var k = "AKIAIOSFODNN7EXAMPLE"; '
             'const g = "AIza' + "B" * 35 + '"; '
