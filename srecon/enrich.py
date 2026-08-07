@@ -145,8 +145,13 @@ def _looks_path(s: str) -> bool:
     path = s.split("?", 1)[0].split("#", 1)[0]   # valida só o path; ?query pode ter =&
     if any(c in _PATH_NOISE for c in path):
         return False
+    if "=" in path:
+        return False  # '=' não pertence ao path (padding base64 de __VIEWSTATE etc.)
     if not re.search(r"[A-Za-z0-9]", path[1:]):
         return False  # precisa de conteúdo alfanumérico após a 1ª barra
+    # segmento gigante = blob/base64 (ex.: __VIEWSTATE '/wEPDwUK...'), não é rota
+    if any(len(seg) > 40 for seg in path.strip("/").split("/")):
+        return False
     return True
 
 

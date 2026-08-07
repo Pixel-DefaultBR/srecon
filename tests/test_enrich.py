@@ -62,6 +62,17 @@ def test_extract_js_endpoints():
     assert not any(c in "".join(eps) for c in "()\\")
 
 
+def test_extract_js_endpoints_rejects_viewstate_blob():
+    # regressão de campo (testaspnet.vulnweb.com): __VIEWSTATE base64 não é rota
+    vs = ('"/wEPDwUKLTEwNTI0MjkwNQ9kFgICAQ9kFgICAQ9kFgQCAQ8WBB4EaHJlZgUKbG9naW4u'
+          'YXNweB4JaW5uZXJodG1sBQVsb2dpbmQCAw8WBB8AZB4HVmlzaWJsZWhkZArjxDMCoNA8" '
+          '"/wEed29uZHdvbmQ9=="')
+    eps = enrich.extract_js_endpoints(vs)
+    assert eps == set()                              # nenhum blob vira endpoint
+    # e uma rota real no meio ainda é pega
+    assert "/login.aspx" in enrich.extract_js_endpoints('a("/login.aspx")')
+
+
 def test_extract_js_params():
     js = 'fetch("/api/search?q=x&page=2&sort_by=date");' 'go("/a?id=1");' 'noise("/b?=&x")'
     params = enrich.extract_js_params(js)
