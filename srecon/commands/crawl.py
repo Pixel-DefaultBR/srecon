@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .. import enrich
+from .. import scope as scopemod
 from ..external import StageResult, resolve_bin, run_stage
 from ..util import utc_stamp
 
@@ -51,15 +52,35 @@ def split_extra(extra: Optional[str]) -> list:
 
 # --------------------------- redação de segredos ---------------------------- #
 
+def strip_userinfo(url: str) -> str:
+    """Remove 'user:pass@' de uma URL/seed, preservando esquema, host e path.
+    Cobre também o caso sem esquema ('user@host/x') que sanitize_proxy não pegava."""
+    if not url or "@" not in url:
+        return url
+    scheme = ""
+    rest = url
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        scheme += "://"
+    if "/" in rest:
+        authority, tail = rest.split("/", 1)
+        tail = "/" + tail
+    else:
+        authority, tail = rest, ""
+    if "@" in authority:                       # userinfo só vive na autoridade
+        authority = authority.rsplit("@", 1)[-1]
+    return scheme + authority + tail
+
+
 def sanitize_proxy(p: str) -> str:
     if p and "://" in p and "@" in p:
         scheme, rest = p.split("://", 1)
         return f"{scheme}://{rest.rsplit('@', 1)[-1]}"
-    return p
+    return strip_userinfo(p)                    # proxy sem esquema também é redigido
 
 
 def redact_args(args: list) -> list:
-    """Redige valores de -H (cookies/auth) e creds em -proxy, p/ log/manifesto."""
+    """Redige valores de -H (cookies/auth), creds em -proxy e userinfo no seed -u."""
     out: list = []
     mode = None
     for a in args:
@@ -71,11 +92,18 @@ def redact_args(args: list) -> list:
             out.append(sanitize_proxy(str(a)))
             mode = None
             continue
+        if mode == "u":
+            # seed pode ser lista separada por vírgula (https://x,http://x)
+            out.append(",".join(strip_userinfo(s) for s in str(a).split(",")))
+            mode = None
+            continue
         out.append(a)
         if a == "-H":
             mode = "H"
         elif a == "-proxy":
             mode = "proxy"
+        elif a == "-u":
+            mode = "u"
     return out
 
 
@@ -172,6 +200,15 @@ def update_latest(parent: Path, run_dir: Path) -> None:
 
 # --------------------------------- katana ----------------------------------- #
 
+def harden_dir(path: Path) -> None:
+    """0700 no run dir: protege bodies/segredos world-readable mesmo se um writer
+    esquecer o modo restrito (defesa em profundidade além do _write_private)."""
+    try:
+        os.chmod(path, stat.S_IRWXU)
+    except OSError:
+        pass
+
+
 def run_katana(args: list) -> int:
     try:
         return subprocess.run(args).returncode
@@ -202,10 +239,12 @@ def write_meta(run_dir: Path, target: str, seeds: str, katana_bin: str,
     if opts.get("proxy"):
         opts["proxy"] = sanitize_proxy(str(opts["proxy"]))
     safe_args = redact_args(args)
+    safe_target = strip_userinfo(target)
+    safe_seeds = ",".join(strip_userinfo(s) for s in seeds.split(","))
     meta = {
         "generated_at_utc": utc_stamp(),
-        "target": target,
-        "seeds": seeds,
+        "target": safe_target,
+        "seeds": safe_seeds,
         "run_dir": str(run_dir),
         "katana_bin": katana_bin,
         "options": opts,
@@ -215,8 +254,8 @@ def write_meta(run_dir: Path, target: str, seeds: str, katana_bin: str,
     lines = [
         "# katana crawl — manifesto",
         f"generated_at_utc : {meta['generated_at_utc']}",
-        f"target           : {target}",
-        f"seeds            : {seeds}",
+        f"target           : {safe_target}",
+        f"seeds            : {safe_seeds}",
         f"run_dir          : {run_dir}",
         f"katana_bin       : {katana_bin}",
         "",
@@ -237,6 +276,8 @@ class CrawlArtifacts:
     param_names: list = field(default_factory=list)
     subdomains: list = field(default_factory=list)
     api_endpoints: list = field(default_factory=list)
+    js_endpoints: list = field(default_factory=list)   # rotas mineradas de bodies/JS
+    all_params: list = field(default_factory=list)      # união URL+forms+JS (wordlist p/ fuzz)
     forms: list = field(default_factory=list)     # dicts
     secrets: list = field(default_factory=list)    # (rule, frag, url)
     records: int = 0
@@ -250,6 +291,8 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
     pnames: set = set()
     subs: set = set()
     apis: set = set()
+    js_eps: set = set()          # rotas escondidas mineradas de bodies (APIs escondidas)
+    all_params: set = set()      # união de todos os nomes de param vistos
     forms: list = []
     secrets: set = set()
     records = 0
@@ -277,7 +320,9 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
                     js.add(ep)
                 if enrich.has_params(ep):
                     params.add(ep)
-                    pnames.update(enrich.param_names(ep))
+                    pn = enrich.param_names(ep)
+                    pnames.update(pn)
+                    all_params.update(pn)
                 if enrich.is_api(ep):
                     apis.add(ep)
                 h = enrich.url_host(ep)
@@ -292,6 +337,16 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
                     f = dict(f)
                     f["url"] = ep
                     forms.append(f)
+                    all_params.update(f.get("inputs", []))   # params de formulário
+                # minera rotas/params embutidos no body (bundles JS, <script> inline)
+                for e in enrich.extract_js_endpoints(snippet):
+                    js_eps.add(e)
+                    if enrich.is_api(e):
+                        apis.add(e)
+                    hh = enrich.url_host(e)
+                    if hh:
+                        subs.add(hh)
+                all_params.update(enrich.extract_js_params(snippet))
                 if scan_secrets:
                     for rule, frag in enrich.scan_secrets(snippet):
                         secrets.add((rule, frag, ep))
@@ -302,6 +357,8 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
     art.param_names = sorted(pnames)
     art.subdomains = sorted(subs)
     art.api_endpoints = sorted(apis)
+    art.js_endpoints = sorted(js_eps)
+    art.all_params = sorted(all_params)
     art.forms = forms
     art.secrets = sorted(secrets)
     art.records = records
@@ -320,22 +377,79 @@ def write_artifacts(art: CrawlArtifacts, run_dir: Path) -> None:
     _write_lines(run_dir / "js.txt", art.js)
     _write_lines(run_dir / "endpoints-with-params.txt", art.param_urls)
     _write_lines(run_dir / "param-names.txt", art.param_names)
+    _write_lines(run_dir / "params-all.txt", art.all_params)
     _write_lines(run_dir / "subdomains.txt", art.subdomains)
     _write_lines(run_dir / "api-endpoints.txt", art.api_endpoints)
+    _write_lines(run_dir / "js-endpoints.txt", art.js_endpoints)
     form_lines = [
         f'{f.get("method", "GET")} {f.get("action", "")}  '
         f'inputs=[{",".join(f.get("inputs", []))}]  (em {f.get("url", "")})'
         for f in art.forms
     ]
     _write_lines(run_dir / "forms.txt", form_lines)
+    # segredos são sensíveis: 0600 (não world-readable como os demais artefatos)
     sec_lines = [f"{rule}\t{frag}\t{url}" for (rule, frag, url) in art.secrets]
-    _write_lines(run_dir / "secrets.txt", sec_lines)
+    _write_private(run_dir / "secrets.txt", "\n".join(sec_lines) + ("\n" if sec_lines else ""))
+
+
+# ------------------------- blindagem de escopo (ativo) ---------------------- #
+
+def in_scope_host(host: str, entries: list, target_host: str, override: bool) -> bool:
+    """Host autorizado a receber tráfego ATIVO? Casa os scope/*.txt; no modo
+    --i-am-authorized, restringe ao próprio alvo e seus subdomínios (conservador)."""
+    if not host:
+        return False
+    if entries and scopemod.match(host, entries):
+        return True
+    if override:
+        th = (target_host or "").lower().rstrip(".")
+        return bool(th) and (host == th or host.endswith("." + th))
+    return False
+
+
+def scope_partition(art: "CrawlArtifacts", entries: list, target_host: str,
+                    override: bool) -> tuple[list, list]:
+    """Separa o que foi DESCOBERTO em: URLs in-scope (podem ser probadas) e hosts
+    externos (NUNCA tocados). URLs relativas ('/x') são same-origin → in-scope."""
+    def ok(h):
+        return in_scope_host(h, entries, target_host, override)
+
+    inscope_urls: list = []
+    external: set = set()
+    for u in art.all_urls:
+        h = enrich.url_host(u)
+        if h is None or ok(h):        # relativa (None) = same-origin
+            inscope_urls.append(u)
+        else:
+            external.add(h)
+    # hosts externos também podem surgir de URLs absolutas mineradas de JS e de subs
+    for u in art.js_endpoints:
+        if u.startswith(("http://", "https://")):
+            h = enrich.url_host(u)
+            if h and not ok(h):
+                external.add(h)
+    for h in art.subdomains:
+        if not ok(h):
+            external.add(h)
+    return inscope_urls, sorted(external)
+
+
+def write_scope_split(run_dir: Path, inscope_urls: list, external: list) -> None:
+    _write_lines(run_dir / "all-urls-inscope.txt", inscope_urls)
+    if external:
+        header = [
+            "# HOSTS DESCOBERTOS FORA DE ESCOPO — a ferramenta NAO os testa.",
+            "# Listados so p/ consciencia situacional. Scan ativo aqui exige NOVA autorizacao.",
+            "",
+        ]
+        _write_lines(run_dir / "external-hosts.txt", header + external)
 
 
 # ----------------------------------- diff ----------------------------------- #
 
 _DIFF_FILES = ["all-urls.txt", "endpoints-with-params.txt", "subdomains.txt",
-               "param-names.txt", "api-endpoints.txt"]
+               "param-names.txt", "api-endpoints.txt", "js-endpoints.txt",
+               "params-all.txt"]
 
 
 def _read_set(p: Path) -> set:
@@ -392,10 +506,11 @@ def run_probe_and_chain(run_dir: Path, all_urls: Path, do_chain: bool,
 
 def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
                     diff: dict, prev_dir: Optional[Path], stages: list,
-                    scope_source: str) -> None:
+                    scope_source: str, external: Optional[list] = None) -> None:
     def cell(s):
         return str(s).replace("|", "/").replace("\n", " ").replace("`", "'")
 
+    external = external or []
     lines = [
         f"# Crawl — {cell(target)}", "",
         f"- **registros JSONL:** {art.records}",
@@ -403,13 +518,20 @@ def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
         f"- **JS:** {len(art.js)}",
         f"- **endpoints c/ params:** {len(art.param_urls)}",
         f"- **param names únicos:** {len(art.param_names)}",
+        f"- **params (todos, p/ fuzz):** {len(art.all_params)}",
         f"- **subdomínios:** {len(art.subdomains)}",
         f"- **API endpoints:** {len(art.api_endpoints)}",
+        f"- **JS endpoints (escondidos):** {len(art.js_endpoints)}",
         f"- **forms:** {len(art.forms)}",
         f"- **possíveis segredos:** {len(art.secrets)}",
+        f"- **hosts externos (NÃO testados):** {len(external)}",
         f"- **scope:** {cell(scope_source)}",
         "",
     ]
+    if external:
+        lines += ["## Hosts externos descobertos (fora de escopo — não testados)", ""]
+        lines += [f"- `{cell(h)}`" for h in external[:100]]
+        lines.append("")
     if diff:
         base = f"vs {prev_dir.name}" if prev_dir else "sem baseline (primeiro run)"
         lines += [f"## Novidades desde o último run ({base})", ""]

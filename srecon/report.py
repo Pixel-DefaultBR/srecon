@@ -110,6 +110,159 @@ def print_search(result: SearchResult, fields: list[str]) -> None:
         console.print(ft)
 
 
+def print_subs(result) -> None:
+    console.print(
+        f"[bold]{len(result.subdomains)}[/bold] subdomínio(s) — "
+        f"[green]{len(result.resolved)}[/green] resolvem, "
+        f"[cyan]{len(result.in_scope)}[/cyan] em escopo, "
+        f"[yellow]{len(result.out_scope)}[/yellow] fora"
+    )
+    inset = set(result.in_scope)
+    rows = result.resolved or [(h, []) for h in result.subdomains]
+    if rows:
+        t = Table(box=box.MINIMAL_DOUBLE_HEAD)
+        t.add_column("host")
+        t.add_column("IPs")
+        t.add_column("escopo")
+        for host, ips in rows[:80]:
+            tag = "[cyan]in[/cyan]" if host in inset else "[yellow]out[/yellow]"
+            t.add_row(_s(host), _s(", ".join(ips)) if ips else "-", tag)
+        console.print(t)
+        if len(rows) > 80:
+            console.print(f"[dim]… (+{len(rows) - 80}) — ver subs.txt/resolved.txt[/dim]")
+
+
+def write_subs_files(result, outdir: Path) -> None:
+    def _w(name, items):
+        (outdir / name).write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
+    _w("subs.txt", result.subdomains)
+    _w("resolved.txt", [f"{h}\t{','.join(ips)}" for h, ips in result.resolved])
+    _w("in-scope.txt", result.in_scope)
+    lines = [f"# Subdomínios — {result.domain}", "",
+             f"- **total:** {len(result.subdomains)}",
+             f"- **resolvem:** {len(result.resolved)}",
+             f"- **em escopo:** {len(result.in_scope)}",
+             f"- **fora de escopo:** {len(result.out_scope)}", "",
+             "## Resolvidos", "", "| host | IPs | escopo |", "|---|---|---|"]
+    inset = set(result.in_scope)
+    for host, ips in result.resolved:
+        lines.append(f"| {_md_cell(host)} | {_md_cell(','.join(ips))} | "
+                     f"{'in' if host in inset else 'out'} |")
+    (outdir / "subs.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def print_cve_details(details, errors) -> None:
+    for d in details:
+        flags = []
+        if d.kev:
+            flags.append("[red]KEV[/red]")
+        if d.ransomware_campaign and d.ransomware_campaign.lower() != "unknown":
+            flags.append(f"[red]ransomware:{escape(d.ransomware_campaign)}[/red]")
+        cvss = d.cvss_v3 if d.cvss_v3 is not None else d.cvss
+        epss = f"{d.epss * 100:.1f}%" if d.epss is not None else "-"
+        head = Table(box=box.SIMPLE, show_header=False)
+        head.add_column("k", style="cyan")
+        head.add_column("v")
+        head.add_row("CVE", f"[bold]{_s(d.cve_id)}[/bold] {'  '.join(flags)}")
+        head.add_row("CVSS", f"{cvss:.1f}" if cvss is not None else "-")
+        head.add_row("EPSS", f"{epss} (rank {d.ranking_epss:.2f})" if d.ranking_epss is not None else epss)
+        head.add_row("publicado", _s(d.published_time))
+        head.add_row("resumo", _s((d.summary or "")[:400]))
+        if d.propose_action:
+            head.add_row("ação", _s(d.propose_action[:300]))
+        console.print(head)
+    for cid, msg in errors:
+        console.print(f"[yellow]{_s(cid)}: {_s(msg)}[/yellow]")
+
+
+def print_vuln_rollup(aggs, enriched=None, msf_map=None) -> None:
+    enriched = enriched or {}
+    msf_map = msf_map or {}
+    console.print(f"[bold]{len(aggs)}[/bold] CVE(s) distintas nos relatórios salvos")
+    if not aggs:
+        return
+    t = Table(box=box.MINIMAL_DOUBLE_HEAD)
+    cols = ["CVE", "CVSS", "verif", "hosts"]
+    if enriched:
+        cols += ["KEV", "EPSS"]
+    if msf_map:
+        cols += ["MSF"]
+    cols += ["alvos"]
+    for c in cols:
+        t.add_column(c)
+    for e in aggs:
+        row = [_s(e.cve),
+               f"{e.max_cvss:.1f}" if e.max_cvss is not None else "-",
+               "✓" if e.verified else "",
+               str(e.count)]
+        if enriched:
+            d = enriched.get(e.cve)
+            row.append("[red]sim[/red]" if (d and d.kev) else "")
+            row.append(f"{d.epss * 100:.0f}%" if (d and d.epss is not None) else "-")
+        if msf_map:
+            mods = msf_map.get(e.cve) or []
+            row.append(f"[red]{len(mods)}[/red]" if mods else "0")
+        row.append(_s(", ".join(e.hosts[:6]) + (" …" if len(e.hosts) > 6 else "")))
+        t.add_row(*row)
+    console.print(t)
+
+
+def write_vulns_md(aggs, path: Path, enriched=None, msf_map=None) -> None:
+    enriched = enriched or {}
+    msf_map = msf_map or {}
+    lines = ["# Rollup de vulnerabilidades (cross-host)", "",
+             f"- **CVEs distintas:** {len(aggs)}", "",
+             "| CVE | CVSS | verif | #hosts | KEV | EPSS | MSF | alvos |",
+             "|---|---|---|---|---|---|---|---|"]
+    for e in aggs:
+        d = enriched.get(e.cve)
+        mods = msf_map.get(e.cve) or []
+        lines.append(
+            f"| {_md_cell(e.cve)} | {e.max_cvss if e.max_cvss is not None else '-'} | "
+            f"{'sim' if e.verified else ''} | {e.count} | "
+            f"{'sim' if (d and d.kev) else ''} | "
+            f"{round(d.epss * 100) if (d and d.epss is not None) else '-'} | "
+            f"{len(mods)} | {_md_cell(', '.join(e.hosts))} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def print_msf(result) -> None:
+    console.print(
+        f"[bold]metasploit[/bold] — alvo [cyan]{_s(result.target)}[/cyan] "
+        f"({len(result.cve_hits)} CVE(s), {result.total_cve_modules} módulo(s) por CVE)"
+    )
+    hits = [h for h in result.cve_hits if h.modules]
+    if hits:
+        t = Table(title="CVE → módulos (alta precisão)", box=box.MINIMAL_DOUBLE_HEAD)
+        for c in ("CVE", "CVSS", "#", "módulos (rank)"):
+            t.add_column(c)
+        for h in hits:
+            top = ", ".join(f"{escape(m.fullname)} ({m.rank_label})" for m in h.modules[:4])
+            if len(h.modules) > 4:
+                top += f" (+{len(h.modules) - 4})"
+            t.add_row(_s(h.cve), f"{h.cvss:.1f}" if h.cvss is not None else "-",
+                      str(len(h.modules)), top or "-")
+        console.print(t)
+    else:
+        console.print("[dim]nenhum módulo casado por CVE.[/dim]")
+
+    prod = [p for p in result.product_hits if p.modules]
+    if prod:
+        pt = Table(title="produto → candidatos (por palavra-chave; ruído possível)",
+                   box=box.SIMPLE)
+        for c in ("produto", "versão", "portas", "#", "top módulos"):
+            pt.add_column(c)
+        for p in prod:
+            top = ", ".join(escape(m.fullname) for m in p.modules[:3])
+            if len(p.modules) > 3:
+                top += f" (+{len(p.modules) - 3})"
+            pt.add_row(_s(p.product), _s(p.version),
+                       " ".join(str(x) for x in p.ports) or "-",
+                       str(len(p.modules)), top or "-")
+        console.print(pt)
+
+
 # ------------------------------ writers ------------------------------------- #
 
 def write_json(obj, path: Path) -> None:
@@ -160,6 +313,36 @@ def write_host_md(report: HostReport, path: Path) -> None:
             f"| {s.port}/{s.transport} | {_md_cell(s.product)} | {_md_cell(s.version)} | "
             f"{_md_cell(s.module)} | {len(s.vulns)} |"
         )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_msf_md(result, path: Path) -> None:
+    lines = [f"# Metasploit — {result.target or '-'}", "",
+             f"- **RHOSTS:** {result.rhosts or '-'}",
+             f"- **CVEs com módulo:** {len([h for h in result.cve_hits if h.modules])}",
+             f"- **módulos por CVE:** {result.total_cve_modules}", ""]
+    hits = [h for h in result.cve_hits if h.modules]
+    if hits:
+        lines += ["## CVE → módulos", "", "| CVE | CVSS | módulo | tipo | rank |", "|---|---|---|---|---|"]
+        for h in hits:
+            for m in h.modules:
+                lines.append(
+                    f"| {_md_cell(h.cve)} | {h.cvss if h.cvss is not None else '-'} | "
+                    f"{_md_cell(m.fullname)} | {_md_cell(m.mtype)} | {_md_cell(m.rank_label)} |"
+                )
+        lines.append("")
+    prod = [p for p in result.product_hits if p.modules]
+    if prod:
+        lines += ["## Produto → candidatos (palavra-chave)", "",
+                  "| produto | versão | portas | módulo | rank |", "|---|---|---|---|---|"]
+        for p in prod:
+            for m in p.modules[:20]:
+                lines.append(
+                    f"| {_md_cell(p.product)} | {_md_cell(p.version)} | "
+                    f"{_md_cell(' '.join(map(str, p.ports)))} | {_md_cell(m.fullname)} | "
+                    f"{_md_cell(m.rank_label)} |"
+                )
+        lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

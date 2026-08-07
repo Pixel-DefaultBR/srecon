@@ -121,3 +121,82 @@ def scan_secrets(text: str, max_len: int = 120) -> list[tuple[str, str]]:
         for m in rx.finditer(text):
             out.append((name, m.group(0)[:max_len]))
     return out
+
+
+# --------------------- mineração de endpoints/params em JS -------------------- #
+# "APIs escondidas": bundles de JS carregam rotas que nunca aparecem como <a href>.
+# Extraímos literais de string que sejam URL absoluta OU caminho absoluto (/...).
+# Alto sinal: exigimos estrutura de path/URL e recusamos regex/template/CSS.
+
+# literais entre aspas simples, duplas ou crase (sem quebra de linha)
+_QUOTED_RE = re.compile(r"""'([^'\n\r]{2,512})'|"([^"\n\r]{2,512})"|`([^`\n\r]{2,512})`""")
+# ruído que denuncia regex/glob/template/seletor no CORPO do path (a query é tratada à parte)
+_PATH_NOISE = set("<>{}()|\\^$*?!`")
+# no corpo de uma URL a query é permitida; só barramos caracteres claramente inválidos
+_URL_NOISE = set("<>{}\\^`")
+
+
+def _looks_path(s: str) -> bool:
+    """Caminho absoluto plausível: '/a/b', '/api/v1/users?id=1', '/x.json'."""
+    if len(s) < 2 or len(s) > 300 or s.startswith("//"):
+        return False  # '//' é protocol-relative/comentário, não path
+    if any(c.isspace() for c in s) or "${" in s:
+        return False  # template string, não endpoint literal
+    path = s.split("?", 1)[0].split("#", 1)[0]   # valida só o path; ?query pode ter =&
+    if any(c in _PATH_NOISE for c in path):
+        return False
+    if not re.search(r"[A-Za-z0-9]", path[1:]):
+        return False  # precisa de conteúdo alfanumérico após a 1ª barra
+    return True
+
+
+def _looks_url(s: str) -> bool:
+    if any(c.isspace() for c in s) or "${" in s or any(c in _URL_NOISE for c in s):
+        return False
+    try:
+        sp = urlsplit(s)
+    except ValueError:
+        return False
+    return bool(sp.scheme in ("http", "https") and sp.netloc)
+
+
+def _iter_string_literals(text: str):
+    for m in _QUOTED_RE.finditer(text):
+        s = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        if s:
+            yield s
+
+
+def extract_js_endpoints(text: str) -> set[str]:
+    """URLs absolutas e caminhos '/...' embutidos em literais de string do JS/body."""
+    out: set[str] = set()
+    if not text:
+        return out
+    for s in _iter_string_literals(text):
+        if s.startswith(("http://", "https://")):
+            if _looks_url(s):
+                out.add(s)
+        elif s.startswith("/"):
+            if _looks_path(s):
+                out.add(s)
+    return out
+
+
+def extract_js_params(text: str) -> set[str]:
+    """Nomes de parâmetro de query encontrados em literais de string do JS."""
+    out: set[str] = set()
+    if not text:
+        return out
+    for s in _iter_string_literals(text):
+        # só olhamos literais que tenham query string ('?a=1' ou 'x?a=1&b=2')
+        if "?" not in s or any(c.isspace() for c in s):
+            continue
+        q = s.split("?", 1)[1].split("#", 1)[0]
+        if "=" not in q:
+            continue
+        for pair in re.split(r"[&;]", q):
+            name = pair.split("=", 1)[0].strip()
+            # nome de param: token simples, sem template/interpolação
+            if name and len(name) <= 64 and re.fullmatch(r"[A-Za-z0-9_.\-\[\]]+", name):
+                out.add(name)
+    return out

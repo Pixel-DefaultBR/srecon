@@ -1,14 +1,30 @@
 [project]
 name = "srecon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shodan-powered recon CLI para a estação de auditoria srv1876073"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Pixel-DefaultBR" }]
+keywords = ["shodan", "recon", "osint", "pentest", "metasploit", "cve"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+]
 dependencies = [
     "shodan>=1.31",
     "typer>=0.12",
     "rich>=13.7",
     "pydantic>=2.6",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/Pixel-DefaultBR/srecon"
 
 [project.scripts]
 srecon = "srecon.cli:main"
@@ -20,3 +36,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["srecon*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

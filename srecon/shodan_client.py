@@ -11,7 +11,14 @@ class ShodanClientError(Exception):
     pass
 
 
-_TRANSIENT = ("rate limit", "timeout", "timed out", "temporar", "502", "503", "504")
+# A lib do shodan mapeia TODA falha de rede (reset/DNS/requests.Timeout) para
+# APIError("Unable to connect to Shodan") e corpo não-JSON para "Unable to parse
+# JSON response". Precisamos casar essas strings, senão o blip transitório mais
+# comum levanta erro na hora, sem retry. 401/403 permanecem terminais.
+_TRANSIENT = (
+    "rate limit", "unable to connect", "unable to parse json",
+    "temporar", "502", "503", "504", "timeout", "timed out",
+)
 
 
 class ShodanClient:
@@ -52,9 +59,13 @@ class ShodanClient:
     def count(self, query: str, facets=None) -> dict:
         return self._retry(self._api.count, query, facets=facets)
 
-    def search(self, query: str, facets=None, limit: int = 100) -> SearchResult:
+    def search(self, query: str, facets=None, limit: int = 100,
+               minify: bool = False) -> SearchResult:
+        # minify=False (default): a lib usa minify=True e descarta o banner (data)
+        # e detalhes ssl/http/vulns — sinal grátis (créditos são por página, não por
+        # tamanho). Mantemos o banner p/ popular data_preview e enriquecer o match.
         matches: list[SearchMatch] = []
-        first = self._retry(self._api.search, query, facets=facets, page=1)
+        first = self._retry(self._api.search, query, facets=facets, page=1, minify=minify)
         total = first.get("total", 0) or 0
 
         def _absorb(page_matches) -> bool:
@@ -69,7 +80,7 @@ class ShodanClient:
         while not done and len(matches) < total:
             time.sleep(self.rate_delay)
             try:
-                res = self._retry(self._api.search, query, page=page)
+                res = self._retry(self._api.search, query, page=page, minify=minify)
             except ShodanClientError:
                 # Paginação além da 1ª página pode exigir plano superior; em vez de
                 # descartar tudo, devolve o que já foi coletado.
