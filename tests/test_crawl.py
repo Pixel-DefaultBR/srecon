@@ -116,6 +116,20 @@ def test_process_jsonl_mines_js_endpoints_and_params(tmp_path):
     assert art.records == 2
 
 
+def test_process_jsonl_flags_interesting(tmp_path):
+    lines = [
+        _rec("https://site.example.com/index.html", "<html>ok</html>"),
+        _rec("https://site.example.com/web.config", "<config/>"),
+        _rec("https://site.example.com/backup.zip", "PK..."),
+    ]
+    jf = tmp_path / "output.jsonl"
+    jf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    art = crawl.process_jsonl(jf, scan_secrets=False)
+    assert "https://site.example.com/web.config" in art.interesting
+    assert "https://site.example.com/backup.zip" in art.interesting
+    assert "https://site.example.com/index.html" not in art.interesting
+
+
 def test_process_jsonl_missing_file(tmp_path):
     art = crawl.process_jsonl(tmp_path / "nope.jsonl", scan_secrets=True)
     assert art.records == 0 and art.all_urls == []

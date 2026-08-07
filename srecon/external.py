@@ -126,3 +126,39 @@ def parse_httpx_urls(jsonl_file: Path) -> list[str]:
 
 def https_targets_from_httpx(jsonl_file: Path) -> list[str]:
     return [u for u in parse_httpx_urls(jsonl_file) if u.startswith("https://")]
+
+
+def parse_httpx_records(jsonl_file: Path) -> list:
+    """Records ricos do httpx-toolkit (-json -td): url/status/title/webserver/tech/ips/cdn.
+    O httpx já coleta `tech` (fingerprint estilo Wappalyzer) — antes só extraíamos a URL."""
+    recs: list = []
+    if not jsonl_file.is_file():
+        return recs
+    for line in jsonl_file.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        recs.append({
+            "url": o.get("url") or o.get("input"),
+            "status": o.get("status_code"),
+            "title": o.get("title"),
+            "webserver": o.get("webserver"),
+            "tech": list(o.get("tech") or []),
+            "content_length": o.get("content_length"),
+            "ips": list(o.get("a") or []),
+            "cdn": o.get("cdn_name"),
+        })
+    return recs
+
+
+def tech_summary(records: list) -> list:
+    """Agrega a contagem de cada tecnologia vista nos records do httpx, desc."""
+    counts: dict = {}
+    for r in records:
+        for t in (r.get("tech") or []):
+            counts[t] = counts.get(t, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))

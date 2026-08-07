@@ -81,6 +81,23 @@ def test_extract_js_params():
     assert enrich.extract_js_params("var x = 1;") == set()
 
 
+def test_is_interesting():
+    interessantes = [
+        "https://x/.git/config", "https://x/backup.zip", "http://x/.env",
+        "https://x/web.config", "/actuator/env", "https://x/db.sql",
+        "https://x/wp-config.php", "/phpmyadmin/", "https://x/id_rsa",
+        "https://x/app.jar", "https://x/config.yml", "https://x/dump.sql?x=1",
+    ]
+    for u in interessantes:
+        assert enrich.is_interesting(u), u
+    banais = [
+        "https://x/index.html", "https://x/style.css", "https://x/app.js",
+        "https://x/about", "https://x/logo.png", "/api/v1/users",
+    ]
+    for u in banais:
+        assert not enrich.is_interesting(u), u
+
+
 def test_scan_secrets():
     text = ('var k = "AKIAIOSFODNN7EXAMPLE"; '
             'const g = "AIza' + "B" * 35 + '"; '

@@ -278,6 +278,7 @@ class CrawlArtifacts:
     api_endpoints: list = field(default_factory=list)
     js_endpoints: list = field(default_factory=list)   # rotas mineradas de bodies/JS
     all_params: list = field(default_factory=list)      # união URL+forms+JS (wordlist p/ fuzz)
+    interesting: list = field(default_factory=list)     # URLs sensíveis (backup/VCS/config/…)
     forms: list = field(default_factory=list)     # dicts
     secrets: list = field(default_factory=list)    # (rule, frag, url)
     records: int = 0
@@ -359,6 +360,7 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
     art.api_endpoints = sorted(apis)
     art.js_endpoints = sorted(js_eps)
     art.all_params = sorted(all_params)
+    art.interesting = sorted(u for u in urls if enrich.is_interesting(u))
     art.forms = forms
     art.secrets = sorted(secrets)
     art.records = records
@@ -381,6 +383,7 @@ def write_artifacts(art: CrawlArtifacts, run_dir: Path) -> None:
     _write_lines(run_dir / "subdomains.txt", art.subdomains)
     _write_lines(run_dir / "api-endpoints.txt", art.api_endpoints)
     _write_lines(run_dir / "js-endpoints.txt", art.js_endpoints)
+    _write_lines(run_dir / "interesting.txt", art.interesting)
     form_lines = [
         f'{f.get("method", "GET")} {f.get("action", "")}  '
         f'inputs=[{",".join(f.get("inputs", []))}]  (em {f.get("url", "")})'
@@ -449,7 +452,7 @@ def write_scope_split(run_dir: Path, inscope_urls: list, external: list) -> None
 
 _DIFF_FILES = ["all-urls.txt", "endpoints-with-params.txt", "subdomains.txt",
                "param-names.txt", "api-endpoints.txt", "js-endpoints.txt",
-               "params-all.txt"]
+               "params-all.txt", "interesting.txt"]
 
 
 def _read_set(p: Path) -> set:
@@ -522,6 +525,7 @@ def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
         f"- **subdomínios:** {len(art.subdomains)}",
         f"- **API endpoints:** {len(art.api_endpoints)}",
         f"- **JS endpoints (escondidos):** {len(art.js_endpoints)}",
+        f"- **arquivos interessantes (sensíveis):** {len(art.interesting)}",
         f"- **forms:** {len(art.forms)}",
         f"- **possíveis segredos:** {len(art.secrets)}",
         f"- **hosts externos (NÃO testados):** {len(external)}",
@@ -537,6 +541,10 @@ def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
         lines += [f"## Novidades desde o último run ({base})", ""]
         for name, items in diff.items():
             lines.append(f"- **{name}:** +{len(items)}")
+        lines.append("")
+    if art.interesting:
+        lines += ["## Arquivos/paths interessantes (sensíveis)", ""]
+        lines += [f"- `{cell(u)}`" for u in art.interesting[:100]]
         lines.append("")
     if art.secrets:
         lines += ["## Possíveis segredos", "", "| regra | trecho | url |", "|---|---|---|"]

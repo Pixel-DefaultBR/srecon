@@ -14,6 +14,7 @@ from . import msf as msfmod
 from . import scope as scopemod
 from .commands import crawl as crawl_cmd
 from .commands import cve as cve_cmd
+from .commands import fuzz as fuzz_cmd
 from .commands import host as host_cmd
 from .commands import msf as msf_cmd
 from .commands import pipeline as pipeline_cmd
@@ -287,6 +288,7 @@ def _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages, external_
         ("subdomínios", len(art.subdomains)),
         ("API endpoints", len(art.api_endpoints)),
         ("JS endpoints (escondidos)", len(art.js_endpoints)),
+        ("arquivos interessantes", len(art.interesting)),
         ("forms", len(art.forms)),
         ("possíveis segredos", len(art.secrets)),
     ]
@@ -306,6 +308,10 @@ def _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages, external_
     if external_hosts:
         console.print(f"[yellow]hosts externos descobertos (NÃO testados): "
                       f"{len(external_hosts)}[/yellow] — ver external-hosts.txt")
+    if art.interesting:
+        err.print(f"[red]★ {len(art.interesting)} arquivo(s)/path(s) interessante(s)[/red] — ver interesting.txt")
+        for u in art.interesting[:8]:
+            err.print(f"  [red]{escape(u)}[/red]")
     if art.secrets:
         err.print(f"[red]⚠ {len(art.secrets)} possível(is) segredo(s)[/red] — ver secrets.txt")
     if stages:
@@ -683,6 +689,80 @@ def msf(
     elif rc_text:
         console.print("[bold]resource script (triagem):[/bold]")
         console.print(escape(rc_text))
+
+
+# --------------------------------- fuzz ------------------------------------ #
+
+@app.command()
+def fuzz(
+    target: str = typer.Argument(..., help="IP/domínio/URL alvo (ATIVO — gated por scope)."),
+    files: bool = typer.Option(False, "--files", help="Modo 'arquivos interessantes' (lista curada) em vez de diretórios."),
+    wordlist: Optional[Path] = typer.Option(None, "-w", "--wordlist", help="Wordlist custom (default: seclists/dirb ou $SRECON_WORDLIST)."),
+    extensions: str = typer.Option("", "-e", "--extensions", help="Extensões a anexar, ex: .php,.bak,.zip,.old."),
+    match_codes: str = typer.Option("200,204,301,302,307,401,403,405,500", "--mc", help="Status a considerar 'achado'."),
+    threads: int = typer.Option(40, "-t", "--threads", help="Threads do ffuf."),
+    rate: int = typer.Option(0, "--rate", help="req/s (0 = sem limite do ffuf)."),
+    timeout_req: int = typer.Option(10, "--timeout", help="Timeout por request (s)."),
+    max_time: int = typer.Option(900, "--max-time", help="Tempo máx total do ffuf/httpx (s)."),
+    no_probe: bool = typer.Option(False, "--no-probe", help="Não re-probar achados com httpx (fica sem tech/título)."),
+    scope_file: Optional[Path] = typer.Option(None, help="Arquivo de escopo específico."),
+    i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gating."),
+    save: bool = typer.Option(True, help="Salva found.txt/interesting.txt/tech.txt + fuzz.md."),
+    as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru."),
+):
+    """Descoberta de conteúdo: diretórios, arquivos interessantes e tecnologias (ffuf→httpx). ATIVO, gated por scope."""
+    host = crawl_cmd.extract_host(target) or target
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+    hit = scopemod.match(host, entries)
+    if not hit and not i_am_authorized:
+        _die(
+            f"'{host}' não autorizado. fuzz é ativo e exige scope em {config.scope_dir()} "
+            "(Regra de ouro). Use --scope-file ou --i-am-authorized se tiver autorização escrita.",
+            code=3,
+        )
+    if i_am_authorized and not hit:
+        err.print("[yellow]OVERRIDE ativo (--i-am-authorized): scope-gating ignorado.[/yellow]")
+
+    if not fuzz_cmd.resolve_bin("ffuf"):
+        _die("ffuf não encontrado (PATH nem ~/go/bin).", code=127)
+
+    outdir = output_dir(config.reports_dir(), f"fuzz-{host}")
+    scope_src = str(hit.source) if hit else "OVERRIDE (--i-am-authorized)"
+    console.print(f"[bold]fuzz[/bold] de [cyan]{escape(fuzz_cmd.base_url(target))}[/cyan] "
+                  f"({'arquivos' if files else 'diretórios'}, scope: {escape(scope_src)})")
+
+    res = fuzz_cmd.run(
+        target, outdir, files_mode=files,
+        wordlist=str(wordlist) if wordlist else None, extensions=extensions,
+        match_codes=match_codes, threads=threads, rate=rate,
+        timeout_req=timeout_req, ffuf_timeout=max_time, probe=not no_probe,
+    )
+    if res.ffuf_rc == fuzz_cmd.RC_NO_WORDLIST:
+        _die("nenhuma wordlist encontrada. Instale seclists ou passe -w/--wordlist (ou $SRECON_WORDLIST).", code=2)
+    if res.ffuf_rc == fuzz_cmd.RC_NO_FFUF:
+        _die("ffuf indisponível.", code=127)
+
+    if as_json:
+        import json as _json
+        console.print_json(_json.dumps({
+            "target": res.target, "base_url": res.base_url, "mode": res.mode,
+            "wordlist": res.wordlist, "hits": res.hits,
+            "tech": [{"tech": t, "count": c} for t, c in res.tech],
+            "interesting": [h.get("url") for h in res.interesting],
+        }))
+    else:
+        report.print_fuzz(res)
+
+    if save:
+        fuzz_cmd.write_artifacts(res, outdir)
+        report.write_fuzz_md(res, outdir / "fuzz.md")
+        console.print(f"[dim]salvo em {outdir}[/dim]")
 
 
 # ------------------------------ scope-check -------------------------------- #

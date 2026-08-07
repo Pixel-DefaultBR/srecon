@@ -187,6 +187,41 @@ def extract_js_endpoints(text: str) -> set[str]:
     return out
 
 
+# ------------------------- arquivos/paths "interessantes" -------------------- #
+# Alto sinal de exposição: backup/VCS/config/segredo/painel. Usado p/ realçar
+# achados do crawl e do fuzz (não é veredito — é priorização de atenção).
+_INTERESTING_EXT = re.compile(
+    r"\.(?:bak|old|orig|save|swp|swo|tmp|copy|inc|"
+    r"zip|tar|gz|tgz|bz2|rar|7z|"
+    r"sql|db|sqlite|sqlite3|dump|mdb|"
+    r"log|"
+    r"env|ini|conf|cfg|config|yml|yaml|toml|properties|"
+    r"pem|key|crt|cer|p12|pfx|jks|keystore|"
+    r"war|jar|"
+    r"git|~)$",
+    re.IGNORECASE,
+)
+_INTERESTING_PATH = re.compile(
+    r"(?:/\.git\b|/\.svn\b|/\.hg\b|/\.bzr\b|"
+    r"/\.env\b|/\.ds_store\b|/\.aws\b|/\.ssh\b|/\.npmrc\b|/\.htpasswd\b|/\.htaccess\b|"
+    r"/web\.config\b|/wp-config\.php|/config\.(?:php|json|ya?ml)|/settings\.py|"
+    r"/application\.properties|/appsettings\.json|"
+    r"/phpinfo\.php|/info\.php|/server-status\b|/server-info\b|/actuator\b|"
+    r"/swagger\b|/openapi\b|/api-docs\b|/graphql\b|/adminer\b|/phpmyadmin\b|"
+    r"/\.well-known/security\.txt|"
+    r"/id_rsa\b|/id_dsa\b|/credentials\b|/backup\b|/dump\b|/\.bash_history\b)",
+    re.IGNORECASE,
+)
+
+
+def is_interesting(url: str) -> bool:
+    """True se a URL/path tem cara de arquivo/endpoint sensível (backup/VCS/config/etc.)."""
+    s = (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if not s:
+        return False
+    return bool(_INTERESTING_EXT.search(s) or _INTERESTING_PATH.search(s))
+
+
 def extract_js_params(text: str) -> set[str]:
     """Nomes de parâmetro de query encontrados em literais de string do JS."""
     out: set[str] = set()

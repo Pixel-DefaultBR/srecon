@@ -55,6 +55,11 @@ srecon pipeline 10.0.0.5 --stages httpx,nuclei --severity high,critical
 srecon pipeline --from-subs cloudwiser.com.br
 srecon pipeline --from-file alvos.txt    # 1 alvo por linha ('#' = comentário)
 
+# descoberta de conteúdo: diretórios, arquivos interessantes e tecnologias (ATIVO, gated)
+srecon fuzz cortex.cloudwiser.com.br                 # dirs (ffuf) -> httpx tech/título
+srecon fuzz cortex.cloudwiser.com.br --files         # lista curada (.git/.env/backup/…)
+srecon fuzz cortex.cloudwiser.com.br -e .php,.bak,.zip -w /caminho/wordlist.txt
+
 # crawl ativo com katana (gated por scope): URLs/JS/params/subs + forms/segredos/API + diff
 srecon crawl cortex.cloudwiser.com.br
 srecon crawl https://app.cortex.cloudwiser.com.br/ -d 4 -H 'Cookie: session=abc'
@@ -81,6 +86,15 @@ mas **nunca manda tráfego ativo** para o que não está autorizado:
 - **params p/ fuzzing**: `params-all.txt` = união de params de URL + inputs de forms + JS.
 - **encadeamento**: `--httpx` (probe -> `live.txt`) e `--chain` (httpx-toolkit -> nuclei),
   rodando **só** sobre `all-urls-inscope.txt` (hosts externos ficam em `external-hosts.txt`).
+
+## Descoberta de conteúdo & tecnologias
+- **`fuzz`** (ATIVO, gated): `ffuf` acha diretórios/arquivos → `httpx` confirma vivo e puxa
+  **tech** (fingerprint estilo Wappalyzer), **título** e **webserver**. Realça achados
+  sensíveis (`★`). Saídas: `found.txt`, `interesting.txt`, `tech.txt`, `fuzz.md`.
+  - `--files`: usa lista curada embutida (`.git/`, `.env`, `web.config`, `backup.sql`, …).
+  - `-w` wordlist custom (default: seclists/dirb, ou `$SRECON_WORDLIST`); `-e` extensões.
+- **tech no `pipeline`**: o estágio httpx já roda com `-td` — agora agrega e grava `tech.txt`.
+- **interessantes no `crawl`**: classifica a saída em `interesting.txt` (backup/VCS/config/etc.).
 
 ## Scope-gating
 - Alvo precisa bater em algum `/root/audits/scope/*.txt` (domínio, wildcard `*.x` ou CIDR).

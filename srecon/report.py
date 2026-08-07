@@ -110,6 +110,61 @@ def print_search(result: SearchResult, fields: list[str]) -> None:
         console.print(ft)
 
 
+def print_fuzz(res) -> None:
+    console.print(
+        f"[bold]fuzz[/bold] [cyan]{_s(res.base_url)}[/cyan] "
+        f"({res.mode}) — [green]{len(res.hits)}[/green] achado(s), "
+        f"[red]{len(res.interesting)}[/red] interessante(s)"
+    )
+    if res.hits:
+        t = Table(box=box.MINIMAL_DOUBLE_HEAD)
+        for c in ("status", "tam", "url", "tech / título"):
+            t.add_column(c)
+        for h in res.hits[:120]:
+            extra = ", ".join(h.get("tech") or []) or _s(h.get("title"))
+            url = h.get("url") or "-"
+            mark = "[red]★[/red] " if h.get("interesting") else ""
+            t.add_row(str(h.get("status") or "-"), str(h.get("length") or "-"),
+                      mark + _s(url), _s(extra))
+        console.print(t)
+        if len(res.hits) > 120:
+            console.print(f"[dim]… (+{len(res.hits) - 120}) — ver found.txt[/dim]")
+
+    if res.interesting:
+        console.print(f"[red]★ {len(res.interesting)} arquivo(s)/path(s) interessante(s):[/red]")
+        for h in res.interesting[:40]:
+            console.print(f"  [red]{h.get('status')}[/red] {_s(h.get('url'))}")
+
+    if res.tech:
+        tt = Table(title="tecnologias detectadas", box=box.SIMPLE)
+        tt.add_column("tech")
+        tt.add_column("hosts/paths", justify="right")
+        for name, n in res.tech[:30]:
+            tt.add_row(_s(name), str(n))
+        console.print(tt)
+
+
+def write_fuzz_md(res, path: Path) -> None:
+    lines = [f"# Fuzz — {res.base_url}", "",
+             f"- **modo:** {res.mode}",
+             f"- **wordlist:** {res.wordlist or '-'}",
+             f"- **achados:** {len(res.hits)}",
+             f"- **interessantes:** {len(res.interesting)}", ""]
+    if res.tech:
+        lines += ["## Tecnologias", "", "| tech | contagem |", "|---|---|"]
+        lines += [f"| {_md_cell(t)} | {c} |" for t, c in res.tech]
+        lines.append("")
+    if res.interesting:
+        lines += ["## Interessantes", "", "| status | url |", "|---|---|"]
+        lines += [f"| {h.get('status')} | {_md_cell(h.get('url'))} |" for h in res.interesting]
+        lines.append("")
+    lines += ["## Todos os achados", "", "| status | tam | url | tech |", "|---|---|---|---|"]
+    for h in res.hits:
+        lines.append(f"| {h.get('status')} | {h.get('length')} | {_md_cell(h.get('url'))} | "
+                     f"{_md_cell(', '.join(h.get('tech') or []))} |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_subs(result) -> None:
     console.print(
         f"[bold]{len(result.subdomains)}[/bold] subdomínio(s) — "

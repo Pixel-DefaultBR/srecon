@@ -10,9 +10,11 @@ from .. import scope as scopemod
 from ..external import (
     StageResult,
     https_targets_from_httpx,
+    parse_httpx_records,
     parse_httpx_urls,
     resolve_bin,
     run_stage,
+    tech_summary,
 )
 from ..shodan_client import ShodanClient
 
@@ -141,6 +143,12 @@ def run_stages(
             live = parse_httpx_urls(httpx_out)
             if live:
                 live_urls_file.write_text("\n".join(live) + "\n", encoding="utf-8")
+            # tecnologias: o httpx já roda com -td; agrega e realça (antes descartado)
+            techs = tech_summary(parse_httpx_records(httpx_out))
+            if techs:
+                (outdir / "tech.txt").write_text(
+                    "\n".join(f"{t}\t{c}" for t, c in techs) + "\n", encoding="utf-8")
+                results[-1].note = "tech: " + ", ".join(t for t, _ in techs[:6])
 
     if "nuclei" in stages:
         nuclei = resolve_bin("nuclei")
