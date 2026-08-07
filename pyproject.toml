@@ -1,0 +1,22 @@
+[project]
+name = "srecon"
+version = "0.1.0"
+description = "Shodan-powered recon CLI para a estação de auditoria srv1876073"
+requires-python = ">=3.11"
+dependencies = [
+    "shodan>=1.31",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+srecon = "srecon.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["srecon*"]

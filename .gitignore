@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg-link
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# segredos / config local — NUNCA versionar
+config.toml
+queries.toml
+*.credentials
+.env
