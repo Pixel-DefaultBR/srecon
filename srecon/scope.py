@@ -23,24 +23,32 @@ class ScopeEntry:
         return not (self.domains or self.cidrs or self.ips)
 
 
-def parse_scope_text(text: str, source: Path) -> ScopeEntry:
-    entry = ScopeEntry(source=source)
+# Marcadores de negação/exclusão: uma linha com qualquer um deles NÃO autoriza nada.
+# (Bug histórico: findall no blob inteiro autorizava domínios citados em notas de
+# "fora de escopo" — o gate alimenta scans ATIVOS, então isso era grave.)
+NEGATION_RE = re.compile(
+    r"fora\s+de\s+escopo|exclu[ií]|n[ãa]o\s+tocar|out[\s-]?of[\s-]?scope|"
+    r"\bexclude\b|\bexcluded\b|\bdeny\b|\bblock(?:ed|list)?\b|\bNOT\b",
+    re.IGNORECASE,
+)
 
+
+def _absorb_line(line: str, entry: ScopeEntry) -> None:
     # IPv4 CIDRs primeiro, depois IPv4 avulsos
-    for m in CIDR_RE.findall(text):
+    for m in CIDR_RE.findall(line):
         try:
             entry.cidrs.append(ipaddress.ip_network(m, strict=False))
         except ValueError:
             pass
-    text_wo_cidr = CIDR_RE.sub(" ", text)
-    for m in IP_RE.findall(text_wo_cidr):
+    line_wo_cidr = CIDR_RE.sub(" ", line)
+    for m in IP_RE.findall(line_wo_cidr):
         try:
             entry.ips.add(str(ipaddress.ip_address(m)))
         except ValueError:
             pass
 
     # IPv6 (endereços e CIDRs): varre tokens com >=2 ':'
-    for tok in re.split(r"[\s,;]+", text):
+    for tok in re.split(r"[\s,;]+", line):
         host = tok.strip().strip("[]")
         if host.count(":") < 2:
             continue
@@ -59,11 +67,24 @@ def parse_scope_text(text: str, source: Path) -> ScopeEntry:
             except ValueError:
                 pass
 
-    for m in DOMAIN_RE.findall(text):
+    for m in DOMAIN_RE.findall(line):
         d = m.lower()
         if d.startswith("*."):
             d = d[2:]
         entry.domains.add(d)
+
+
+def parse_scope_text(text: str, source: Path) -> ScopeEntry:
+    """Autoriza SÓ o que está em linhas de allow. Linhas de comentário (#, //) ou
+    com marcador de negação são ignoradas por completo — nada nelas autoriza."""
+    entry = ScopeEntry(source=source)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        if NEGATION_RE.search(line):
+            continue
+        _absorb_line(line, entry)
     return entry
 
 
@@ -99,6 +120,7 @@ def _normalize_host(target: str) -> str:
     if "://" in target:
         target = target.split("://", 1)[1]
     target = target.split("/", 1)[0]        # tira path
+    target = target.split("?", 1)[0].split("#", 1)[0]  # tira query/fragment sem '/'
     target = target.rsplit("@", 1)[-1]      # tira userinfo
     if target.startswith("["):              # [ipv6] ou [ipv6]:port
         end = target.find("]")

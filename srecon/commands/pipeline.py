@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import subs as subs_cmd
 from .. import scope as scopemod
 from ..external import (
     StageResult,
@@ -45,6 +46,10 @@ def gather_targets(
     from_host: Optional[str],
     from_search: Optional[str],
     search_limit: int,
+    from_subs: Optional[str] = None,
+    from_file: Optional[Path] = None,
+    sub_timeout: int = 300,
+    dns_timeout: int = 120,
 ) -> list:
     raw: list = []
     if target:
@@ -57,6 +62,20 @@ def gather_targets(
     if from_search:
         res = client.search(from_search, limit=search_limit)
         raw.extend(m.ip for m in res.matches if m.ip)
+    if from_subs:
+        # subfinder -> dnsx: os hostnames vivos casam com scope wildcard '*.dominio'
+        found, _ = subs_cmd.enumerate_subdomains(from_subs, timeout=sub_timeout)
+        hosts = sorted(set(found) | {from_subs.strip().lower()})
+        resolved, _ = subs_cmd.resolve_hosts(hosts, timeout=dns_timeout)
+        raw.extend(h for h, _ in resolved) if resolved else raw.extend(hosts)
+    if from_file:
+        try:
+            for line in Path(from_file).read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    raw.append(line)
+        except OSError as e:
+            raise ValueError(f"não consegui ler --from-file {from_file}: {e}") from e
 
     seen: set = set()
     ordered: list = []

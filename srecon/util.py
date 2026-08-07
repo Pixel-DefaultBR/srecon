@@ -19,7 +19,16 @@ def slugify(s: str, max_len: int = 100) -> str:
 
 
 def output_dir(base: Path, target: str) -> Path:
-    """Cria e retorna base/<slug>/<UTCstamp>/ (convenção reports/ da casa)."""
-    d = base / slugify(target) / utc_stamp()
-    d.mkdir(parents=True, exist_ok=True)
+    """Cria e retorna base/<slug>/<UTCstamp>/ (convenção reports/ da casa).
+    Desambigua colisão no mesmo segundo (senão o 2º run sobrescreveria o 1º)."""
+    parent = base / slugify(target)
+    stamp = utc_stamp()
+    d = parent / stamp
+    for i in range(2, 1000):
+        try:
+            d.mkdir(parents=True, exist_ok=False)
+            return d
+        except FileExistsError:
+            d = parent / f"{stamp}-{i}"
+    d.mkdir(parents=True, exist_ok=True)   # fallback improvável
     return d

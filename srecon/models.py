@@ -147,6 +147,38 @@ class SearchResult(BaseModel):
     facets: dict[str, list[FacetItem]] = Field(default_factory=dict)
 
 
+class CveDetail(BaseModel):
+    cve_id: str
+    summary: Optional[str] = None
+    cvss: Optional[float] = None
+    cvss_v3: Optional[float] = None
+    epss: Optional[float] = None
+    ranking_epss: Optional[float] = None
+    kev: bool = False                       # Known Exploited Vuln (CISA)
+    ransomware_campaign: Optional[str] = None
+    propose_action: Optional[str] = None
+    published_time: Optional[str] = None
+    references: list[str] = Field(default_factory=list)
+    cpes: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_api(cls, d: dict) -> "CveDetail":
+        return cls(
+            cve_id=str(d.get("cve_id") or d.get("id") or "?"),
+            summary=d.get("summary"),
+            cvss=_to_float(d.get("cvss")),
+            cvss_v3=_to_float(d.get("cvss_v3")),
+            epss=_to_float(d.get("epss")),
+            ranking_epss=_to_float(d.get("ranking_epss")),
+            kev=bool(d.get("kev")),
+            ransomware_campaign=(d.get("ransomware_campaign") or None),
+            propose_action=d.get("propose_action"),
+            published_time=d.get("published_time"),
+            references=list(d.get("references") or [])[:40],
+            cpes=list(d.get("cpes") or [])[:40],
+        )
+
+
 class PlanInfo(BaseModel):
     plan: Optional[str] = None
     query_credits: Optional[int] = None

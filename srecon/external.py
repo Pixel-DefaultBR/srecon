@@ -28,15 +28,37 @@ _EXTRA_BIN_DIRS = [
 ]
 
 
+# Aliases canônicos por nome lógico: 1º o nome renomeado do Kali, depois o nome
+# padrão (go install / git). Assim a tool acha o binário tanto no Kali quanto num
+# host onde as ferramentas vieram de `go install` (httpx) ou do repo (testssl.sh).
+_ALIASES = {
+    "httpx": ["httpx-toolkit", "httpx"],
+    "testssl": ["testssl", "testssl.sh"],
+}
+
+
+def _candidates(name: str) -> list:
+    cands = list(_ALIASES.get(name, [BINARIES.get(name, name)]))
+    if name not in cands:
+        cands.append(name)
+    seen: set = set()
+    out: list = []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def resolve_bin(name: str) -> Optional[str]:
-    real = BINARIES.get(name, name)
-    found = shutil.which(real)
-    if found:
-        return found
-    for d in _EXTRA_BIN_DIRS:
-        cand = d / real
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
+    for real in _candidates(name):
+        found = shutil.which(real)
+        if found:
+            return found
+        for d in _EXTRA_BIN_DIRS:
+            cand = d / real
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
     return None
 
 
