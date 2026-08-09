@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import getpass
+import inspect
+import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
+from typer.models import ArgumentInfo, OptionInfo
 from rich.console import Console
 from rich.markup import escape
 
+from . import __version__
 from . import config, report
 from . import cvedb
 from . import msf as msfmod
 from . import scope as scopemod
+from .commands import auto as auto_cmd
 from .commands import crawl as crawl_cmd
 from .commands import cve as cve_cmd
 from .commands import fuzz as fuzz_cmd
@@ -25,7 +30,13 @@ from .shodan_client import ShodanClient, ShodanClientError
 from .util import output_dir, slugify, utc_stamp
 
 app = typer.Typer(
-    help="srecon — recon com Shodan para a estação srv1876073.",
+    help=(
+        "srecon — recon com Shodan para a estação srv1876073.\n\n"
+        "Consultas ao Shodan são [bold]passivas[/bold] (batem no banco, não no alvo). "
+        "Os comandos [bold]ativos[/bold] — pipeline, crawl, fuzz — enviam tráfego ao "
+        "alvo e por isso são bloqueados por escopo: o alvo precisa estar em algum "
+        "scope/*.txt (Regra de ouro). Rode 'srecon scope-check ALVO' antes."
+    ),
     no_args_is_help=True,
     add_completion=False,
     # NUNCA mostrar locals no traceback: `key` da API vive como variável local.
@@ -56,9 +67,157 @@ def _die(msg: str, code: int = 1):
     raise typer.Exit(code=code)
 
 
+def _invoke(cmd_fn, **overrides):
+    """Chama uma função de comando Typer reusando os defaults REAIS dela (extraídos
+    dos OptionInfo/ArgumentInfo — chamar direto usaria o sentinela do Typer como valor)
+    e sobrescrevendo só o que o `auto` precisa. Robusto a novos parâmetros; ignora
+    override que o comando não tem (ex.: passar dry_run p/ um comando sem dry_run)."""
+    kwargs: dict = {}
+    for name, p in inspect.signature(cmd_fn).parameters.items():
+        d = p.default
+        kwargs[name] = d.default if isinstance(d, (OptionInfo, ArgumentInfo)) else d
+    for k, v in overrides.items():
+        if k in kwargs:
+            kwargs[k] = v
+    return cmd_fn(**kwargs)
+
+
+# ------------------------ help: exemplos por comando ----------------------- #
+# Exemplos completos por comando (mostrados no `srecon <cmd> --help`). rich markup:
+# use [dim]/[bold]; NÃO use '[' literal em comandos (o rich tenta parsear como tag).
+
+APP_EPILOG = (
+    "[bold cyan]Começando[/bold cyan]\n"
+    "  srecon init                  [dim]# salva a API key do Shodan (0600)[/dim]\n"
+    "  srecon selftest              [dim]# checagens offline, sem tocar na API[/dim]\n"
+    "  srecon host 1.2.3.4          [dim]# recon passivo (banco do Shodan)[/dim]\n"
+    "  srecon scope-check alvo.com  [dim]# ativo só toca alvo em scope/*.txt[/dim]\n"
+    "\n"
+    "[dim]Passivo = consulta o banco do Shodan (não toca o alvo). Ativo (pipeline/"
+    "crawl/fuzz) = envia tráfego ao alvo → bloqueado por escopo. Detalhes no README.[/dim]"
+)
+
+EXAMPLES = {
+    "init": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "  srecon init                  [dim]# cola a key (não ecoa) e valida[/dim]\n"
+        "  export SHODAN_API_KEY=...    [dim]# alternativa via ambiente[/dim]"
+    ),
+    "host": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "  srecon host 1.2.3.4\n"
+        "  srecon host 1.2.3.4 --history          [dim]# inclui histórico (+credits)[/dim]\n"
+        "  srecon host cortex.example.com --json  [dim]# JSON cru p/ jq/pipeline[/dim]"
+    ),
+    "search": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# busca com agregações (facets)[/dim]\n"
+        "  srecon search 'org:\"ACME\" port:443' --facets country,product --limit 200\n"
+        "[dim]# só conta — não gasta 1 credit por página[/dim]\n"
+        "  srecon search 'ssl.cert.subject.cn:\"*.example.com\"' --count\n"
+        "[dim]# salva a query e reusa depois[/dim]\n"
+        "  srecon search 'org:\"ACME\"' --save-as acme\n"
+        "  srecon search --saved acme"
+    ),
+    "pipeline": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# alvo único (precisa estar em scope/*.txt)[/dim]\n"
+        "  srecon pipeline cortex.example.com\n"
+        "[dim]# FUNIL: enumera subdomínios e joga os vivos no pipeline[/dim]\n"
+        "  srecon pipeline --from-subs example.com\n"
+        "[dim]# a partir de uma query Shodan (fora de escopo é descartado)[/dim]\n"
+        "  srecon pipeline --from-search 'org:\"ACME\"' --search-limit 30 --dry-run\n"
+        "[dim]# escolher estágios e severidade[/dim]\n"
+        "  srecon pipeline 10.0.0.5 --stages httpx,nuclei --severity high,critical"
+    ),
+    "crawl": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# crawl ativo (gated); recupera sourcemaps e minera JS/segredos[/dim]\n"
+        "  srecon crawl cortex.example.com\n"
+        "[dim]# com cookie/header e profundidade maior[/dim]\n"
+        "  srecon crawl https://app.example.com/ -d 4 -H 'Cookie: session=abc'\n"
+        "[dim]# encadeia httpx-toolkit -> nuclei só nos in-scope[/dim]\n"
+        "  srecon crawl cortex.example.com --chain --severity high,critical\n"
+        "[dim]# prévia sem executar / desligar sourcemaps[/dim]\n"
+        "  srecon crawl cortex.example.com --dry-run\n"
+        "  srecon crawl cortex.example.com --no-sourcemaps"
+    ),
+    "subs": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# enum passivo (subfinder -> dnsx); anota in/out de escopo[/dim]\n"
+        "  srecon subs example.com\n"
+        "[dim]# rápido, sem resolver DNS[/dim]\n"
+        "  srecon subs example.com --fast --no-resolve"
+    ),
+    "cve": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# CVSS/EPSS/KEV via CVEDB (grátis) + módulos do Metasploit[/dim]\n"
+        "  srecon cve CVE-2021-44228 CVE-2011-2523 --msf"
+    ),
+    "vulns": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# agrega CVEs dos host.json salvos, enriquece (KEV/EPSS) e mapeia MSF[/dim]\n"
+        "  srecon vulns --enrich --msf --min-cvss 7.0"
+    ),
+    "msf": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# lookup passivo no Shodan -> CVEs/produtos -> módulos[/dim]\n"
+        "  srecon msf 1.2.3.4\n"
+        "[dim]# CVE direto (offline, sem API)[/dim]\n"
+        "  srecon msf --cve CVE-2021-44228\n"
+        "[dim]# gera triage.rc (RHOSTS pronto, SEM 'run')[/dim]\n"
+        "  srecon msf 10.0.0.5 --cve CVE-2021-44228 --rc\n"
+        "[dim]# a partir de um host.json já salvo[/dim]\n"
+        "  srecon msf --report reports/host-x/stamp/host.json --min-rank great"
+    ),
+    "fuzz": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# diretórios (ffuf) -> httpx confirma vivo + tech/título[/dim]\n"
+        "  srecon fuzz cortex.example.com\n"
+        "[dim]# lista curada de arquivos sensíveis (.git/.env/backup...)[/dim]\n"
+        "  srecon fuzz cortex.example.com --files\n"
+        "[dim]# extensões e wordlist custom[/dim]\n"
+        "  srecon fuzz cortex.example.com -e .php,.bak,.zip -w /path/wordlist.txt"
+    ),
+    "scope-check": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# testa autorização offline (sem API)[/dim]\n"
+        "  srecon scope-check cortex.example.com\n"
+        "  srecon scope-check 10.0.0.5 --scope-file scope/cliente.txt"
+    ),
+    "auto": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# recon COMPLETO com um comando (passivo + ativo se em escopo)[/dim]\n"
+        "  srecon example.com\n"
+        "  srecon auto example.com          [dim]# forma explícita[/dim]\n"
+        "[dim]# só passivo (não toca o alvo) / ver o plano sem executar[/dim]\n"
+        "  srecon example.com --passive-only\n"
+        "  srecon example.com --dry-run"
+    ),
+}
+
+
+def _version_cb(value: bool):
+    if value:
+        console.print(f"srecon {__version__}")
+        raise typer.Exit()
+
+
+@app.callback(epilog=APP_EPILOG)
+def _root(
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V", is_eager=True, callback=_version_cb,
+        help="Mostra a versão e sai.",
+    ),
+):
+    # Callback raiz: só hospeda --version. O texto de ajuda do grupo vem do
+    # help= do typer.Typer() acima (que tem precedência sobre esta docstring).
+    return
+
+
 # --------------------------------- init ------------------------------------ #
 
-@app.command()
+@app.command(epilog=EXAMPLES["init"])
 def init(
     validate: bool = typer.Option(True, help="Valida a key no Shodan antes de salvar."),
 ):
@@ -91,7 +250,7 @@ def info():
 
 # --------------------------------- host ------------------------------------ #
 
-@app.command()
+@app.command(epilog=EXAMPLES["host"])
 def host(
     target: str = typer.Argument(..., help="IP ou domínio."),
     history: bool = typer.Option(False, help="Inclui histórico (mais query credits)."),
@@ -117,7 +276,7 @@ def host(
 
 # -------------------------------- search ----------------------------------- #
 
-@app.command()
+@app.command(epilog=EXAMPLES["search"])
 def search(
     query: Optional[str] = typer.Argument(None, help='Query Shodan, ex: "org:\\"Empresa\\" port:443".'),
     facets: Optional[str] = typer.Option(None, help="Facets separados por vírgula: country,org,port."),
@@ -180,7 +339,7 @@ def search(
 
 # ------------------------------- pipeline ---------------------------------- #
 
-@app.command()
+@app.command(epilog=EXAMPLES["pipeline"])
 def pipeline(
     target: Optional[str] = typer.Argument(None, help="IP ou domínio alvo."),
     from_host: Optional[str] = typer.Option(None, help="Coleta alvos de um host do Shodan (IP)."),
@@ -288,6 +447,8 @@ def _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages, external_
         ("subdomínios", len(art.subdomains)),
         ("API endpoints", len(art.api_endpoints)),
         ("JS endpoints (escondidos)", len(art.js_endpoints)),
+        ("JS c/ sourcemap", len(art.js_with_sourcemap)),
+        ("fontes recuperados (sourcemap)", art.sources_recovered),
         ("arquivos interessantes", len(art.interesting)),
         ("forms", len(art.forms)),
         ("possíveis segredos", len(art.secrets)),
@@ -320,7 +481,7 @@ def _print_crawl_summary(target, run_dir, art, diff, prev_dir, stages, external_
             console.print(f"  chain {escape(s.name)}: {tag}")
 
 
-@app.command()
+@app.command(epilog=EXAMPLES["crawl"])
 def crawl(
     target: str = typer.Argument(..., help="IP/domínio/URL alvo do crawl."),
     depth: int = typer.Option(3, "-d", "--depth", help="Profundidade (>=3 p/ known-files)."),
@@ -344,6 +505,7 @@ def crawl(
     i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gating."),
     do_diff: bool = typer.Option(True, "--diff/--no-diff", help="diff vs run anterior (latest)."),
     scan_secrets: bool = typer.Option(True, "--secrets/--no-secrets", help="varre bodies por segredos."),
+    sourcemaps: bool = typer.Option(True, "--sourcemaps/--no-sourcemaps", help="baixa .map de JS in-scope e recupera o fonte (ATIVO, gated)."),
     chain: bool = typer.Option(False, "--chain", help="encadeia httpx-toolkit -> nuclei nos achados."),
     do_httpx: bool = typer.Option(False, "--httpx", help="probe httpx-toolkit em all-urls (-> live.txt)."),
     severity: str = typer.Option("low,medium,high,critical", help="severidades do nuclei (no --chain)."),
@@ -418,6 +580,16 @@ def crawl(
         err.print(f"[yellow]katana saiu com código {rc}; processando o capturado.[/yellow]")
 
     art = crawl_cmd.process_jsonl(run_dir / "output.jsonl", scan_secrets)
+    # sourcemaps: baixa .map de JS IN-SCOPE e recupera o fonte original (mais rico p/
+    # minerar endpoints/segredos que o bundle minificado). ATIVO -> gated por scope.
+    if sourcemaps:
+        sm = crawl_cmd.harvest_sourcemaps(art, run_dir, entries, host, i_am_authorized, scan_secrets)
+        if sm.get("fetched"):
+            console.print(
+                f"[dim]sourcemaps: {sm['fetched']}/{sm['candidates']} baixados, "
+                f"{sm['recovered_sources']} fontes recuperados"
+                + (" (limite atingido)" if sm.get("capped") else "") + "[/dim]"
+            )
     crawl_cmd.write_artifacts(art, run_dir)
     diff = crawl_cmd.compute_diff(run_dir, prev_dir) if do_diff else {}
 
@@ -425,6 +597,7 @@ def crawl(
     # (JS de terceiros, redirects, etc.) vão p/ external-hosts.txt e NUNCA são tocados.
     inscope_urls, external_hosts = crawl_cmd.scope_partition(art, entries, host, i_am_authorized)
     crawl_cmd.write_scope_split(run_dir, inscope_urls, external_hosts)
+    crawl_cmd.write_js_inventory(run_dir, art, external_hosts)
     if external_hosts:
         err.print(f"[yellow]{len(external_hosts)} host(s) externos descobertos — "
                   "NÃO serão testados (ver external-hosts.txt).[/yellow]")
@@ -443,7 +616,7 @@ def crawl(
 
 # --------------------------------- subs ------------------------------------ #
 
-@app.command()
+@app.command(epilog=EXAMPLES["subs"])
 def subs(
     domain: str = typer.Argument(..., help="Domínio raiz (ex: example.com)."),
     all_sources: bool = typer.Option(True, "--all/--fast", help="Todas as fontes do subfinder (mais lento) vs. rápido."),
@@ -496,7 +669,7 @@ def subs(
 
 # --------------------------------- cve ------------------------------------- #
 
-@app.command()
+@app.command(epilog=EXAMPLES["cve"])
 def cve(
     cves: list[str] = typer.Argument(..., help="Uma ou mais CVEs (ex: CVE-2021-44228)."),
     with_msf: bool = typer.Option(False, "--msf", help="Também mapeia cada CVE para módulos do Metasploit."),
@@ -537,7 +710,7 @@ def cve(
 
 # -------------------------------- vulns ------------------------------------ #
 
-@app.command()
+@app.command(epilog=EXAMPLES["vulns"])
 def vulns(
     reports: Optional[Path] = typer.Option(None, help="Diretório de relatórios (default: reports/ do workspace)."),
     min_cvss: float = typer.Option(0.0, help="Filtra CVEs abaixo deste CVSS."),
@@ -589,7 +762,7 @@ def vulns(
 
 # --------------------------------- msf ------------------------------------- #
 
-@app.command()
+@app.command(epilog=EXAMPLES["msf"])
 def msf(
     target: Optional[str] = typer.Argument(None, help="IP/domínio: lookup passivo no Shodan e mapeia CVEs/produtos → módulos."),
     cve: Optional[str] = typer.Option(None, help="CVE(s) por vírgula p/ mapear direto (offline, sem API)."),
@@ -693,7 +866,7 @@ def msf(
 
 # --------------------------------- fuzz ------------------------------------ #
 
-@app.command()
+@app.command(epilog=EXAMPLES["fuzz"])
 def fuzz(
     target: str = typer.Argument(..., help="IP/domínio/URL alvo (ATIVO — gated por scope)."),
     files: bool = typer.Option(False, "--files", help="Modo 'arquivos interessantes' (lista curada) em vez de diretórios."),
@@ -767,7 +940,7 @@ def fuzz(
 
 # ------------------------------ scope-check -------------------------------- #
 
-@app.command("scope-check")
+@app.command("scope-check", epilog=EXAMPLES["scope-check"])
 def scope_check(
     target: str = typer.Argument(..., help="IP/domínio/URL para testar contra scope/."),
     scope_file: Optional[Path] = typer.Option(None, help="Testa contra um arquivo específico."),
@@ -867,14 +1040,125 @@ def selftest():
     console.print("[green]todos os checks passaram[/green]")
 
 
+# --------------------------------- auto ------------------------------------ #
+
+@app.command(epilog=EXAMPLES["auto"])
+def auto(
+    target: str = typer.Argument(..., help="IP/domínio/URL — roda o recon COMPLETO."),
+    passive_only: bool = typer.Option(False, "--passive-only", help="Só passivo; não envia tráfego ao alvo."),
+    scope_file: Optional[Path] = typer.Option(None, help="Arquivo de escopo específico."),
+    i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gating no estágio ativo."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Mostra o plano e NÃO executa nada."),
+    severity: str = typer.Option("low,medium,high,critical", help="Severidades do nuclei (estágio ativo)."),
+    stage_timeout: int = typer.Option(1800, help="Timeout por estágio ativo (s)."),
+):
+    """Auto: só o alvo -> recon completo. Passivo sempre; ATIVO (crawl/fuzz/pipeline)
+    só se o alvo estiver autorizado por scope (Regra de ouro). É o destino de
+    'srecon <alvo>' sem subcomando."""
+    thost = crawl_cmd.extract_host(target) or target
+    is_ip = auto_cmd.looks_like_ip(thost)
+
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+    hit = scopemod.match(thost, entries)
+    in_scope = bool(hit) or i_am_authorized
+
+    has_key = True
+    try:
+        config.resolve_api_key()
+    except config.ConfigError:
+        has_key = False
+    have_subfinder = bool(subs_cmd.resolve_bin("subfinder"))
+    have_ffuf = bool(fuzz_cmd.resolve_bin("ffuf"))
+
+    console.print(f"[bold]auto[/bold] — recon completo de "
+                  f"[cyan]{escape(crawl_cmd.strip_userinfo(target))}[/cyan] "
+                  f"({'IP' if is_ip else 'domínio'})")
+    if hit:
+        console.print(f"escopo: [green]AUTORIZADO[/green] por {escape(str(hit.source))}")
+    elif i_am_authorized:
+        console.print("escopo: [yellow]OVERRIDE (--i-am-authorized)[/yellow]")
+    else:
+        console.print("escopo: [red]FORA DE ESCOPO[/red] — estágio ativo será pulado")
+
+    # ------------------------------- plano --------------------------------- #
+    plan: list = []
+    if not is_ip:
+        plan.append("subs (passivo)" + ("" if have_subfinder else "  [dim]subfinder ausente → pula[/dim]"))
+    plan.append("host + CVEs (passivo, Shodan)" + ("" if has_key else "  [dim]sem API key → pula[/dim]"))
+    plan.append("vulns/msf (offline)")
+    if passive_only:
+        plan.append("[dim](ativo desligado: --passive-only)[/dim]")
+    elif not in_scope:
+        plan.append("[dim](ativo pulado: fora de escopo)[/dim]")
+    else:
+        plan.append("crawl (ATIVO)")
+        plan.append("fuzz (ATIVO)" + ("" if have_ffuf else "  [dim]ffuf ausente → pula[/dim]"))
+        plan.append("pipeline (ATIVO)")
+    console.print("\n[bold]plano:[/bold]")
+    for i, p in enumerate(plan, 1):
+        console.print(f"  {i}. {p}")
+
+    if dry_run:
+        console.print("\n[yellow]dry-run — nada executado.[/yellow]")
+        return
+
+    def step(title, fn, **kw):
+        console.print(f"\n[bold cyan]▶ {title}[/bold cyan]")
+        try:
+            _invoke(fn, **kw)
+        except typer.Exit as e:
+            code = getattr(e, "exit_code", getattr(e, "code", "?"))
+            err.print(f"[yellow]{escape(title)}: interrompido (exit {code}).[/yellow]")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:  # um passo que falha não derruba o recon inteiro
+            err.print(f"[yellow]{escape(title)}: falhou — {escape(str(e))}[/yellow]")
+
+    # ------------------------------ passivo -------------------------------- #
+    if not is_ip and have_subfinder:
+        step("subs (passivo)", subs, domain=thost, scope_file=scope_file)
+    if has_key:
+        step("host + CVEs (passivo, Shodan)", host, target=target)
+    else:
+        err.print("[yellow]sem API key do Shodan — pulando host. Rode 'srecon init'.[/yellow]")
+    step("vulns/msf (offline)", vulns, enrich=True, with_msf=True)
+
+    # --------------------------- ativo (gated) ----------------------------- #
+    if passive_only:
+        console.print("\n[dim]--passive-only: estágio ativo desligado.[/dim]")
+    elif not in_scope:
+        err.print(f"\n[yellow]ATIVO pulado — '{escape(thost)}' fora de escopo. "
+                  "Adicione em scope/*.txt ou use --i-am-authorized (autorização escrita).[/yellow]")
+    else:
+        step("crawl (ativo)", crawl, target=target, scope_file=scope_file,
+             i_am_authorized=i_am_authorized)
+        if have_ffuf:
+            step("fuzz (ativo)", fuzz, target=target, scope_file=scope_file,
+                 i_am_authorized=i_am_authorized)
+        step("pipeline (ativo)", pipeline, target=target, scope_file=scope_file,
+             i_am_authorized=i_am_authorized, severity=severity, timeout=stage_timeout)
+
+    console.print("\n[green]✓ auto concluído.[/green]")
+
+
 def main():
+    # 'srecon <alvo>' (1º token não é subcomando conhecido) -> 'srecon auto <alvo>'.
+    known = set(typer.main.get_command(app).commands)
+    sys.argv[1:] = auto_cmd.route_argv(sys.argv[1:], known)
     try:
         app()
     except KeyboardInterrupt:
         err.print("[yellow]interrompido[/yellow]")
         raise SystemExit(130)
     except Exception as e:  # último recurso: erro limpo, sem traceback/locals
-        err.print(f"[red]erro inesperado: {type(e).__name__}: {e}[/red]")
+        # escape(): a mensagem pode conter '[...]' vindo do alvo e quebrar o markup do rich
+        err.print(f"[red]erro inesperado: {escape(type(e).__name__)}: {escape(str(e))}[/red]")
         raise SystemExit(1)
 
 
