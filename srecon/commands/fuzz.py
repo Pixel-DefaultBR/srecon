@@ -23,6 +23,7 @@ class FuzzResult:
     tech: list = field(default_factory=list)   # [(tech, count)]
     ffuf_rc: Optional[int] = None
     probed: bool = False
+    wildcard: Optional[dict] = None            # cluster WAF/wildcard descartado, se houve
 
     @property
     def interesting(self) -> list:
@@ -71,6 +72,9 @@ def run(target: str, run_dir: Path, *, files_mode: bool = False,
                                  timeout_req=timeout_req)
     res.ffuf_rc = _run(cmd, ffuf_timeout)
     hits = content.parse_ffuf_json(out_json)
+    # WAF/wildcard: se ~tudo devolve o mesmo (status,length), descarta o cluster
+    # (senão o httpx re-probaria milhares de falsos-positivos — ex.: 403 da Cloudflare).
+    hits, res.wildcard = content.drop_wildcard(hits)
 
     # re-probe os achados com httpx: confirma vivo + puxa tech/title/webserver.
     # (todas as URLs são same-origin do alvo autorizado — não há escape de escopo.)
@@ -95,7 +99,9 @@ def run(target: str, run_dir: Path, *, files_mode: bool = False,
         h["title"] = rec.get("title")
         h["tech"] = rec.get("tech") or []
         h["webserver"] = rec.get("webserver")
-        h["interesting"] = enrich.is_interesting(h.get("input") or h.get("url") or "")
+        # classifica pela URL COMPLETA (com '/'), não pela palavra crua do wordlist —
+        # senão '.git/HEAD' (sem barra) não casa _INTERESTING_PATH e o achado se perde.
+        h["interesting"] = enrich.is_interesting(h.get("url") or h.get("input") or "")
     res.hits = hits
     return res
 

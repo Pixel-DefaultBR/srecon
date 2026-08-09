@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -104,3 +105,29 @@ def parse_ffuf_json(path: Path) -> list:
         })
     out.sort(key=lambda h: (h.get("status") or 0, h.get("url") or ""))
     return out
+
+
+def dominant_cluster(hits: list, ratio: float = 0.85, min_count: int = 25):
+    """Se a esmagadora maioria dos hits compartilha o MESMO (status, length), devolve
+    (status, length, fração, n) — assinatura de WAF/wildcard (mesma resposta p/ todo
+    path, ex.: Cloudflare devolvendo 403 idêntico). Senão, None."""
+    if len(hits) < min_count:
+        return None
+    counts = Counter((h.get("status"), h.get("length")) for h in hits)
+    (status, length), n = counts.most_common(1)[0]
+    frac = n / len(hits)
+    if frac >= ratio:
+        return status, length, frac, n
+    return None
+
+
+def drop_wildcard(hits: list, ratio: float = 0.85, min_count: int = 25):
+    """Remove o cluster dominante (WAF/wildcard) quando ele domina os resultados.
+    Retorna (kept, info) — info=None se não houver wildcard. Evita tratar milhares
+    de 403 idênticos como 'achados' (e não re-probar todos com httpx)."""
+    dc = dominant_cluster(hits, ratio, min_count)
+    if not dc:
+        return hits, None
+    status, length, frac, n = dc
+    kept = [h for h in hits if (h.get("status"), h.get("length")) != (status, length)]
+    return kept, {"status": status, "length": length, "dropped": n, "fraction": round(frac, 4)}

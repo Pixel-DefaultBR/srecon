@@ -921,10 +921,17 @@ def fuzz(
     if res.ffuf_rc == fuzz_cmd.RC_NO_FFUF:
         _die("ffuf indisponível.", code=127)
 
+    if res.wildcard:
+        w = res.wildcard
+        err.print(f"[yellow]⚠ resposta uniforme (provável WAF/wildcard): {w['dropped']} hits "
+                  f"status {w['status']} tam {w['length']} descartados "
+                  f"({int(w['fraction'] * 100)}%). Ajuste --mc ou revise o alvo.[/yellow]")
+
     if as_json:
         import json as _json
         console.print_json(_json.dumps({
             "target": res.target, "base_url": res.base_url, "mode": res.mode,
+            "wildcard": res.wildcard,
             "wordlist": res.wordlist, "hits": res.hits,
             "tech": [{"tech": t, "count": c} for t, c in res.tech],
             "interesting": [h.get("url") for h in res.interesting],
