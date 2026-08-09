@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from .. import enrich
+from .. import fetch as fetchmod
 from .. import scope as scopemod
 from ..external import StageResult, resolve_bin, run_stage
 from ..util import utc_stamp
@@ -281,6 +283,10 @@ class CrawlArtifacts:
     interesting: list = field(default_factory=list)     # URLs sensíveis (backup/VCS/config/…)
     forms: list = field(default_factory=list)     # dicts
     secrets: list = field(default_factory=list)    # (rule, frag, url)
+    sourcemap_refs: list = field(default_factory=list)   # URLs .map referenciadas/baixadas
+    js_with_sourcemap: list = field(default_factory=list)  # JS que declara sourceMappingURL
+    maps_fetched: int = 0                          # sourcemaps baixados com sucesso
+    sources_recovered: int = 0                     # fontes recuperados de sourcemaps
     records: int = 0
 
 
@@ -296,6 +302,8 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
     all_params: set = set()      # união de todos os nomes de param vistos
     forms: list = []
     secrets: set = set()
+    smap_refs: set = set()       # URLs .map referenciadas no JS
+    js_smap: set = set()         # JS que declara sourceMappingURL
     records = 0
 
     art = CrawlArtifacts()
@@ -347,7 +355,23 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
                     hh = enrich.url_host(e)
                     if hh:
                         subs.add(hh)
+                # rotas de chamadas HTTP (fetch/axios/xhr), inclui relativas 'api/v1/x'
+                for r in enrich.extract_js_routes(snippet):
+                    js_eps.add(r)
+                    cand = r if r.startswith(("http://", "https://", "/")) else "/" + r
+                    if enrich.is_api(cand):
+                        apis.add(r)
+                    if r.startswith(("http://", "https://")):
+                        hh = enrich.url_host(r)
+                        if hh:
+                            subs.add(hh)
                 all_params.update(enrich.extract_js_params(snippet))
+                # sourcemaps: só de respostas JS (a URL do JS resolve o .map relativo)
+                if ep and enrich.is_js(ep):
+                    refs = enrich.find_sourcemap_refs(snippet, ep)
+                    if refs:
+                        smap_refs.update(refs)
+                        js_smap.add(ep)
                 if scan_secrets:
                     for rule, frag in enrich.scan_secrets(snippet):
                         secrets.add((rule, frag, ep))
@@ -363,8 +387,15 @@ def process_jsonl(jsonl_path: Path, scan_secrets: bool) -> CrawlArtifacts:
     art.interesting = sorted(u for u in urls if enrich.is_interesting(u))
     art.forms = forms
     art.secrets = sorted(secrets)
+    art.sourcemap_refs = sorted(smap_refs)
+    art.js_with_sourcemap = sorted(js_smap)
     art.records = records
     return art
+
+
+def _md_cell(s) -> str:
+    """Neutraliza chars que quebram célula de tabela markdown."""
+    return str(s).replace("|", "/").replace("\n", " ").replace("`", "'")
 
 
 def _write_lines(path: Path, items) -> None:
@@ -390,9 +421,30 @@ def write_artifacts(art: CrawlArtifacts, run_dir: Path) -> None:
         for f in art.forms
     ]
     _write_lines(run_dir / "forms.txt", form_lines)
-    # segredos são sensíveis: 0600 (não world-readable como os demais artefatos)
-    sec_lines = [f"{rule}\t{frag}\t{url}" for (rule, frag, url) in art.secrets]
+    _write_lines(run_dir / "sourcemaps.txt", art.sourcemap_refs)
+    # segredos são sensíveis: 0600 (não world-readable como os demais artefatos).
+    # ordena por severidade (high->low); o .txt guarda o valor CHEIO + a severidade.
+    secs = sorted(art.secrets, key=lambda t: (enrich.secret_sort_key(t[0]), t[0], t[1]))
+    sec_lines = [f"{enrich.secret_severity(rule)}\t{rule}\t{frag}\t{url}"
+                 for (rule, frag, url) in secs]
     _write_private(run_dir / "secrets.txt", "\n".join(sec_lines) + ("\n" if sec_lines else ""))
+    # secrets.md: valor REDIGIDO, agrupado por severidade (0600 por precaução)
+    if secs:
+        buckets: dict = {"high": [], "medium": [], "low": []}
+        for rule, frag, url in secs:
+            buckets.setdefault(enrich.secret_severity(rule), []).append((rule, frag, url))
+        md = ["# Segredos (possíveis) — valor REDIGIDO; original em secrets.txt (0600)", ""]
+        for sev in ("high", "medium", "low"):
+            items = buckets.get(sev) or []
+            if not items:
+                continue
+            md += [f"## {sev} ({len(items)})", "",
+                   "| regra | valor (redigido) | url |", "|---|---|---|"]
+            for rule, frag, url in items:
+                md.append(f"| {_md_cell(rule)} | `{_md_cell(enrich.redact_secret(frag))}` "
+                          f"| {_md_cell(url)} |")
+            md.append("")
+        _write_private(run_dir / "secrets.md", "\n".join(md) + "\n")
 
 
 # ------------------------- blindagem de escopo (ativo) ---------------------- #
@@ -446,6 +498,100 @@ def write_scope_split(run_dir: Path, inscope_urls: list, external: list) -> None
             "",
         ]
         _write_lines(run_dir / "external-hosts.txt", header + external)
+
+
+# ------------------------- sourcemaps (recupera fonte) ---------------------- #
+
+def _safe_name(url: str, maxlen: int = 80) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", url or "").strip("_")
+    return s[-maxlen:] or "map"
+
+
+def harvest_sourcemaps(art: "CrawlArtifacts", run_dir: Path, entries: list,
+                       target_host: str, override: bool, scan_secrets: bool,
+                       timeout: int = 15, max_maps: int = 100) -> dict:
+    """ATIVO, só hosts IN-SCOPE: baixa os sourcemaps referenciados/adivinhados dos JS
+    descobertos, recupera o fonte (sourcesContent) e minera endpoints/rotas/params/
+    segredos dele. Muta `art` e grava sources-recovered/*.js (0600). O download é gated
+    pela MESMA regra do scan ativo (in_scope_host) — nunca toca host fora de escopo."""
+    def ok(h):
+        return in_scope_host(h, entries, target_host, override)
+
+    # candidatos: refs explícitas + palpite '.map' de cada JS. Só http(s) e host in-scope.
+    cand: list = []
+    seen: set = set()
+    for u in list(art.sourcemap_refs) + [enrich.sourcemap_guess(j) for j in art.js]:
+        if not u or u in seen or not u.startswith(("http://", "https://")):
+            continue
+        seen.add(u)
+        if ok(enrich.url_host(u)):
+            cand.append(u)
+
+    stats = {"candidates": len(cand), "fetched": 0, "recovered_sources": 0, "capped": False}
+    if not cand:
+        return stats
+    if len(cand) > max_maps:
+        cand = cand[:max_maps]
+        stats["capped"] = True
+
+    js_eps = set(art.js_endpoints)
+    apis = set(art.api_endpoints)
+    subs = set(art.subdomains)
+    params = set(art.all_params)
+    secrets = set(art.secrets)
+    rec_dir = run_dir / "sources-recovered"
+    got: list = []
+
+    for map_url in cand:
+        body = fetchmod.get(map_url, timeout=timeout, max_bytes=8_000_000)
+        if not body:
+            continue
+        sm = enrich.parse_sourcemap(body)
+        if not sm["recovered"]:
+            continue
+        stats["fetched"] += 1
+        stats["recovered_sources"] += sm["recovered"]
+        got.append(map_url)
+        combined = "\n".join(sm["contents"])
+        for e in enrich.extract_js_endpoints(combined) | enrich.extract_js_routes(combined):
+            js_eps.add(e)
+            candp = e if e.startswith(("http://", "https://", "/")) else "/" + e
+            if enrich.is_api(candp):
+                apis.add(e)
+            if e.startswith(("http://", "https://")):
+                hh = enrich.url_host(e)
+                if hh:
+                    subs.add(hh)
+        params.update(enrich.extract_js_params(combined))
+        if scan_secrets:
+            for rule, frag in enrich.scan_secrets(combined):
+                secrets.add((rule, frag, map_url))
+        if not rec_dir.exists():
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            harden_dir(rec_dir)
+        _write_private(rec_dir / (_safe_name(map_url) + ".js"), combined[:4_000_000])
+
+    art.js_endpoints = sorted(js_eps)
+    art.api_endpoints = sorted(apis)
+    art.subdomains = sorted(subs)
+    art.all_params = sorted(params)
+    art.secrets = sorted(secrets)
+    art.sourcemap_refs = sorted(set(art.sourcemap_refs) | set(got))
+    art.maps_fetched = stats["fetched"]
+    art.sources_recovered = stats["recovered_sources"]
+    return stats
+
+
+def write_js_inventory(run_dir: Path, art: "CrawlArtifacts", external: list) -> None:
+    """Inventário dos JS: url, party (in-scope/external), tem sourcemap declarado."""
+    ext = set(external or [])
+    smap = set(art.js_with_sourcemap or [])
+    lines = ["# url\tparty\tsourcemap"]
+    for u in art.js:
+        h = enrich.url_host(u) or ""
+        party = "external" if h in ext else "in-scope"
+        lines.append(f"{u}\t{party}\t{'yes' if u in smap else '-'}")
+    _write_lines(run_dir / "js-inventory.txt", lines)
 
 
 # ----------------------------------- diff ----------------------------------- #
@@ -525,6 +671,8 @@ def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
         f"- **subdomínios:** {len(art.subdomains)}",
         f"- **API endpoints:** {len(art.api_endpoints)}",
         f"- **JS endpoints (escondidos):** {len(art.js_endpoints)}",
+        f"- **JS c/ sourcemap:** {len(art.js_with_sourcemap)}",
+        f"- **fontes recuperados (sourcemap):** {art.sources_recovered}",
         f"- **arquivos interessantes (sensíveis):** {len(art.interesting)}",
         f"- **forms:** {len(art.forms)}",
         f"- **possíveis segredos:** {len(art.secrets)}",
@@ -547,9 +695,12 @@ def write_report_md(run_dir: Path, target: str, art: CrawlArtifacts,
         lines += [f"- `{cell(u)}`" for u in art.interesting[:100]]
         lines.append("")
     if art.secrets:
-        lines += ["## Possíveis segredos", "", "| regra | trecho | url |", "|---|---|---|"]
-        for rule, frag, url in art.secrets[:100]:
-            lines.append(f"| {cell(rule)} | `{cell(frag[:80])}` | {cell(url)} |")
+        lines += ["## Possíveis segredos (valor redigido — original em secrets.txt 0600)", "",
+                  "| sev | regra | valor | url |", "|---|---|---|---|"]
+        secs = sorted(art.secrets, key=lambda t: (enrich.secret_sort_key(t[0]), t[0]))
+        for rule, frag, url in secs[:100]:
+            lines.append(f"| {cell(enrich.secret_severity(rule))} | {cell(rule)} | "
+                         f"`{cell(enrich.redact_secret(frag))}` | {cell(url)} |")
         lines.append("")
     if stages:
         lines += ["## Encadeamento", "", "| estágio | rodou | rc | nota |", "|---|---|---|---|"]

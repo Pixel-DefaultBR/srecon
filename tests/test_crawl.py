@@ -133,3 +133,50 @@ def test_process_jsonl_flags_interesting(tmp_path):
 def test_process_jsonl_missing_file(tmp_path):
     art = crawl.process_jsonl(tmp_path / "nope.jsonl", scan_secrets=True)
     assert art.records == 0 and art.all_urls == []
+
+
+def test_process_jsonl_collects_sourcemap_refs(tmp_path):
+    js = "var x=1;\n//# sourceMappingURL=app.min.js.map\n"
+    jf = tmp_path / "output.jsonl"
+    jf.write_text(_rec("https://site.example.com/app.min.js", js) + "\n", encoding="utf-8")
+    art = crawl.process_jsonl(jf, scan_secrets=False)
+    assert art.sourcemap_refs == ["https://site.example.com/app.min.js.map"]
+    assert art.js_with_sourcemap == ["https://site.example.com/app.min.js"]
+
+
+def test_harvest_sourcemaps_is_scope_gated(tmp_path, monkeypatch):
+    from srecon import fetch as fetchmod
+    art = crawl.CrawlArtifacts()
+    art.js = ["https://app.target.com/in.js", "https://cdn.evil.com/out.js"]
+    fetched = []
+    fake = json.dumps({"version": 3, "sources": ["s.js"],
+                       "sourcesContent": ['fetch("/api/v1/secret");var k="ghp_' + "a" * 36 + '";']})
+
+    def fake_get(url, **kw):
+        fetched.append(url)
+        return fake
+
+    monkeypatch.setattr(fetchmod, "get", fake_get)
+    # override=True, sem scope files: só o alvo target.com e seus subdomínios entram
+    stats = crawl.harvest_sourcemaps(art, tmp_path, [], "target.com", override=True, scan_secrets=True)
+
+    # SÓ o host in-scope teve o .map buscado; o host externo NUNCA foi tocado
+    assert fetched == ["https://app.target.com/in.js.map"]
+    assert stats["fetched"] == 1
+    # o fonte recuperado alimenta endpoints e secrets
+    assert "/api/v1/secret" in art.js_endpoints
+    assert any(r == "github_token" for r, _f, _u in art.secrets)
+
+
+def test_write_artifacts_secrets_severity_and_redaction(tmp_path):
+    art = crawl.CrawlArtifacts()
+    art.secrets = [("firebase_db", "app.firebaseio.com", "http://x/a.js"),
+                   ("aws_access_key", "AKIAIOSFODNN7EXAMPLE", "http://x/b.js")]
+    crawl.write_artifacts(art, tmp_path)
+    md = (tmp_path / "secrets.md").read_text()
+    assert md.index("## high") < md.index("## low")          # high antes de low
+    assert "AKIAIOSFODNN7EXAMPLE" not in md                   # md nunca tem o valor cheio
+    assert "AKIA…MPLE" in md
+    txt = (tmp_path / "secrets.txt").read_text()
+    assert "AKIAIOSFODNN7EXAMPLE" in txt                      # o .txt 0600 tem o valor cheio
+    assert "high\taws_access_key" in txt
