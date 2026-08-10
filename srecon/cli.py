@@ -1516,12 +1516,19 @@ def auto(
     else:
         console.print("escopo: [red]FORA DE ESCOPO[/red] — estágio ativo será pulado")
 
+    cand_active = in_scope and not passive_only    # prova ativa dos candidatos só em escopo
+
     # ------------------------------- plano --------------------------------- #
     plan: list = []
     if not is_ip:
         plan.append("subs (passivo)" + ("" if have_subfinder else "  [dim]subfinder ausente → pula[/dim]"))
+        plan.append("urls históricas (passivo: wayback/gau)")
+    plan.append("assets (passivo: CT + ASN/netblock)")
     plan.append("host + CVEs (passivo, Shodan)" + ("" if has_key else "  [dim]sem API key → pula[/dim]"))
     plan.append("vulns/msf (offline)")
+    if not is_ip:
+        plan.append("candidates — hipótese de bug"
+                    + ("  [dim]+ prova ATIVA (em escopo)[/dim]" if cand_active else "  [dim](só classificação passiva)[/dim]"))
     if passive_only:
         plan.append("[dim](ativo desligado: --passive-only)[/dim]")
     elif not in_scope:
@@ -1530,6 +1537,7 @@ def auto(
         plan.append("crawl (ATIVO)")
         plan.append("fuzz (ATIVO)" + ("" if have_ffuf else "  [dim]ffuf ausente → pula[/dim]"))
         plan.append("pipeline (ATIVO)")
+    plan.append("triage (consolida + rankeia tudo)")
     console.print("\n[bold]plano:[/bold]")
     for i, p in enumerate(plan, 1):
         console.print(f"  {i}. {p}")
@@ -1553,11 +1561,19 @@ def auto(
     # ------------------------------ passivo -------------------------------- #
     if not is_ip and have_subfinder:
         step("subs (passivo)", subs, domain=thost, scope_file=scope_file)
+    if not is_ip:
+        step("urls históricas (passivo)", urls, domain=thost, scope_file=scope_file)
+    # assets: CT só faz sentido p/ domínio; p/ IP roda só ASN/netblock (--no-ct)
+    step("assets (passivo)", assets, domain=thost, ct=not is_ip, scope_file=scope_file)
     if has_key:
         step("host + CVEs (passivo, Shodan)", host, target=target)
     else:
         err.print("[yellow]sem API key do Shodan — pulando host. Rode 'srecon init'.[/yellow]")
     step("vulns/msf (offline)", vulns, enrich=True, with_msf=True)
+    # candidates: consome o run de urls acima. Passivo sempre; prova ativa só em escopo.
+    if not is_ip:
+        step("candidates — hipótese de bug", candidates, domain=thost,
+             active=cand_active, scope_file=scope_file, i_am_authorized=i_am_authorized)
 
     # --------------------------- ativo (gated) ----------------------------- #
     if passive_only:
@@ -1573,6 +1589,10 @@ def auto(
                  i_am_authorized=i_am_authorized)
         step("pipeline (ativo)", pipeline, target=target, scope_file=scope_file,
              i_am_authorized=i_am_authorized, severity=severity, timeout=stage_timeout)
+
+    # ------------------------------- triagem ------------------------------- #
+    # consolida candidates + host/CVEs + urls + assets num ranking único.
+    step("triage (consolida + rankeia)", triage, domain=thost)
 
     console.print("\n[green]✓ auto concluído.[/green]")
 
