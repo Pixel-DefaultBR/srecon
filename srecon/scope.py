@@ -18,6 +18,11 @@ class ScopeEntry:
     domains: set = field(default_factory=set)   # domínios base; '*.x' guardado como 'x'
     cidrs: list = field(default_factory=list)   # ipaddress networks (v4 e v6)
     ips: set = field(default_factory=set)       # endereços normalizados (str(ip_address))
+    # DENY: hosts EXPLICITAMENTE fora de escopo. Avaliados globalmente ANTES dos allows
+    # (ver match): um allow wildcard/CIDR NÃO pode re-autorizar o que caiu aqui.
+    deny_domains: set = field(default_factory=set)
+    deny_cidrs: list = field(default_factory=list)
+    deny_ips: set = field(default_factory=set)
 
     def is_empty(self) -> bool:
         return not (self.domains or self.cidrs or self.ips)
@@ -33,17 +38,18 @@ NEGATION_RE = re.compile(
 )
 
 
-def _absorb_line(line: str, entry: ScopeEntry) -> None:
+def _absorb_line(line: str, domains: set, cidrs: list, ips: set) -> None:
+    """Extrai domínios/IPs/CIDRs da linha para as coleções passadas (allow OU deny)."""
     # IPv4 CIDRs primeiro, depois IPv4 avulsos
     for m in CIDR_RE.findall(line):
         try:
-            entry.cidrs.append(ipaddress.ip_network(m, strict=False))
+            cidrs.append(ipaddress.ip_network(m, strict=False))
         except ValueError:
             pass
     line_wo_cidr = CIDR_RE.sub(" ", line)
     for m in IP_RE.findall(line_wo_cidr):
         try:
-            entry.ips.add(str(ipaddress.ip_address(m)))
+            ips.add(str(ipaddress.ip_address(m)))
         except ValueError:
             pass
 
@@ -56,14 +62,14 @@ def _absorb_line(line: str, entry: ScopeEntry) -> None:
             try:
                 net = ipaddress.ip_network(host, strict=False)
                 if net.version == 6:
-                    entry.cidrs.append(net)
+                    cidrs.append(net)
             except ValueError:
                 pass
         else:
             try:
                 ip = ipaddress.ip_address(host)
                 if ip.version == 6:
-                    entry.ips.add(str(ip))
+                    ips.add(str(ip))
             except ValueError:
                 pass
 
@@ -71,20 +77,32 @@ def _absorb_line(line: str, entry: ScopeEntry) -> None:
         d = m.lower()
         if d.startswith("*."):
             d = d[2:]
-        entry.domains.add(d)
+        domains.add(d)
 
 
 def parse_scope_text(text: str, source: Path) -> ScopeEntry:
-    """Autoriza SÓ o que está em linhas de allow. Linhas de comentário (#, //) ou
-    com marcador de negação são ignoradas por completo — nada nelas autoriza."""
+    """Separa ALLOW de DENY. Uma linha de allow autoriza; uma linha com marcador de
+    negação (ou dentro de uma seção de exclusão) alimenta o DENY — que em match()
+    prevalece sobre qualquer allow. Cabeçalhos de comentário (#, //) não absorvem
+    hosts do próprio texto, mas um cabeçalho com marcador de negação ('# Out of
+    scope:') ABRE uma seção de exclusão que dura até a próxima linha em branco."""
     entry = ScopeEntry(source=source)
+    deny_section = False
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("//"):
+        if not line:
+            deny_section = False                     # linha em branco fecha a seção
             continue
-        if NEGATION_RE.search(line):
+        has_neg = bool(NEGATION_RE.search(line))
+        if line.startswith("#") or line.startswith("//"):
+            # cabeçalho/nota: liga/desliga a seção de exclusão conforme o marcador,
+            # mas o texto do comentário em si nunca autoriza NEM nega um host solto.
+            deny_section = has_neg
             continue
-        _absorb_line(line, entry)
+        if has_neg or deny_section:
+            _absorb_line(line, entry.deny_domains, entry.deny_cidrs, entry.deny_ips)
+        else:
+            _absorb_line(line, entry.domains, entry.cidrs, entry.ips)
     return entry
 
 
@@ -130,33 +148,54 @@ def _normalize_host(target: str) -> str:
     return target                           # bare IPv6 (múltiplos ':') ou host puro
 
 
-def match(target: str, entries: list[ScopeEntry]) -> Optional[ScopeEntry]:
-    """Retorna a ScopeEntry que autoriza `target`, ou None."""
-    target = (target or "").strip()
-    if not target:
-        return None
-    # Host com whitespace OU vírgula embutida é malformado/perigoso (a vírgula vira
-    # múltiplos seeds no katana/httpx): jamais autoriza.
-    if re.search(r"[\s,]", target):
-        return None
+def _host_in(host: str, ip_obj, domains: set, cidrs: list, ips: set) -> bool:
+    """host casa alguma das coleções (usado tanto p/ allow quanto p/ deny)."""
+    if ip_obj is not None:
+        return str(ip_obj) in ips or any(ip_obj in net for net in cidrs)
+    return any(_domain_matches(host, d) for d in domains)
 
+
+def _prepare_host(target: str):
+    """(host, ip_obj) normalizado, ou (None, None) se malformado/vazio.
+    Host com whitespace OU vírgula é perigoso (vira múltiplos seeds): rejeita."""
+    target = (target or "").strip()
+    if not target or re.search(r"[\s,]", target):
+        return None, None
     host = _normalize_host(target)
     if not host:
+        return None, None
+    try:
+        return host, ipaddress.ip_address(host)
+    except ValueError:
+        return host, None
+
+
+def is_denied(target: str, entries: list[ScopeEntry]) -> bool:
+    """True se `target` casa uma regra de EXCLUSÃO em qualquer entry. Deny é
+    autoritativo: um host negado nunca é autorizado, mesmo sob allow wildcard/CIDR."""
+    host, ip_obj = _prepare_host(target)
+    if host is None:
+        return False
+    return any(
+        _host_in(host, ip_obj, e.deny_domains, e.deny_cidrs, e.deny_ips) for e in entries
+    )
+
+
+def match(target: str, entries: list[ScopeEntry]) -> Optional[ScopeEntry]:
+    """Retorna a ScopeEntry que autoriza `target`, ou None. DENY prevalece: se o host
+    casa qualquer regra de exclusão (em qualquer arquivo), retorna None mesmo que um
+    allow wildcard/CIDR o cubra."""
+    host, ip_obj = _prepare_host(target)
+    if host is None:
         return None
 
-    ip_obj = None
-    try:
-        ip_obj = ipaddress.ip_address(host)
-    except ValueError:
-        ip_obj = None
-
+    # 1) DENY global primeiro — autoritativo sobre todos os allows.
     for e in entries:
-        if ip_obj is not None:
-            if str(ip_obj) in e.ips:
-                return e
-            if any(ip_obj in net for net in e.cidrs):
-                return e
-        else:
-            if any(_domain_matches(host, d) for d in e.domains):
-                return e
+        if _host_in(host, ip_obj, e.deny_domains, e.deny_cidrs, e.deny_ips):
+            return None
+
+    # 2) allow: primeira entry que cobre o host.
+    for e in entries:
+        if _host_in(host, ip_obj, e.domains, e.cidrs, e.ips):
+            return e
     return None

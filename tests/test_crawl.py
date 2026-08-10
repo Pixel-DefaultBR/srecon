@@ -15,6 +15,71 @@ def test_extract_host_and_seeds():
     assert crawl.build_seeds("https://example.com/") == "https://example.com/"
 
 
+import re as _re
+
+
+def test_derive_field_scope_from_wildcard_scope():
+    e = scope.parse_scope_text("*.example.com", Path("s.txt"))
+    hit = scope.match("www.example.com", [e])
+    rx = crawl.derive_field_scope("www.example.com", hit)
+    pat = _re.compile(rx)
+    # casa hosts autorizados (host e subdomínios); NÃO casa irmão fora de escopo nem lookalike
+    assert pat.search("www.example.com")
+    assert pat.search("example.com")
+    assert pat.search("deep.api.example.com")
+    assert not pat.search("evilexample.com")      # sem o ponto -> não é subdomínio
+    assert not pat.search("example.com.evil.net")
+
+
+def test_derive_field_scope_ip_is_exact_host():
+    e = scope.parse_scope_text("198.51.100.0/24", Path("s.txt"))
+    hit = scope.match("198.51.100.7", [e])
+    rx = crawl.derive_field_scope("198.51.100.7", hit)
+    pat = _re.compile(rx)
+    assert pat.search("198.51.100.7")
+    assert not pat.search("198.51.100.70")        # host exato, não prefixo
+
+
+def test_derive_field_scope_override_locks_to_target():
+    # --i-am-authorized sem hit: trava no host alvo, não vira 'rdn' promíscuo
+    rx = crawl.derive_field_scope("app.target.com", None)
+    pat = _re.compile(rx)
+    assert pat.search("app.target.com")
+    assert not pat.search("other.target.com")
+
+
+def test_build_katana_args_auto_scope_and_dr_default():
+    e = scope.parse_scope_text("*.example.com", Path("s.txt"))
+    hit = scope.match("www.example.com", [e])
+    opt = crawl.CrawlOptions(field_scope=crawl.derive_field_scope("www.example.com", hit))
+    args = crawl.build_katana_args("katana", "https://www.example.com", Path("/tmp/x"), opt)
+    # -dr presente por default (não segue redirect p/ host fora de escopo)
+    assert "-dr" in args
+    # -fs recebe o regex derivado, não a keyword 'rdn'
+    fs_val = args[args.index("-fs") + 1]
+    assert "example" in fs_val and fs_val != "rdn"
+
+
+def test_build_katana_args_follow_redirects_drops_dr():
+    opt = crawl.CrawlOptions(disable_redirects=False)
+    args = crawl.build_katana_args("katana", "https://x", Path("/tmp/x"), opt)
+    assert "-dr" not in args
+
+
+def test_derive_out_scope_from_deny():
+    e = scope.parse_scope_text("*.example.com\n# out of scope:\nadmin.example.com", Path("s.txt"))
+    cos = crawl.derive_out_scope([e])
+    assert cos and "admin" in cos
+    opt = crawl.CrawlOptions(crawl_out_scope=cos)
+    args = crawl.build_katana_args("katana", "https://x", Path("/tmp/x"), opt)
+    assert "-cos" in args and args[args.index("-cos") + 1] == cos
+
+
+def test_derive_out_scope_empty_when_no_deny():
+    e = scope.parse_scope_text("*.example.com", Path("s.txt"))
+    assert crawl.derive_out_scope([e]) == ""
+
+
 def test_redact_args_hides_header_and_proxy_creds():
     args = ["katana", "-u", "x", "-H", "Cookie: s=secret",
             "-proxy", "http://user:pw@127.0.0.1:8080"]

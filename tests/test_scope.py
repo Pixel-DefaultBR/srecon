@@ -60,6 +60,60 @@ def test_negation_and_comment_lines_do_not_authorize():
     assert scope.match("10.0.0.5", [e]) is None                 # 'excluir' + CIDR
 
 
+def test_deny_wins_over_allow_wildcard():
+    # furo HIGH #1: allow wildcard NÃO pode re-autorizar host explicitamente negado.
+    text = ("*.example.com\n"
+            "# Out of scope:\n"
+            "admin.example.com\n"
+            "secret.example.com\n")
+    e = _entry(text)
+    assert scope.match("api.example.com", [e])                  # coberto pelo wildcard
+    assert scope.match("admin.example.com", [e]) is None        # negado apesar do wildcard
+    assert scope.match("secret.example.com", [e]) is None       # mesma seção de exclusão
+    assert scope.is_denied("admin.example.com", [e])
+    assert not scope.is_denied("api.example.com", [e])
+
+
+def test_deny_section_closes_on_blank_line():
+    # a seção de exclusão termina na linha em branco: o que vem depois volta a ALLOW.
+    text = ("# out of scope\n"
+            "old.example.com\n"
+            "\n"
+            "api.example.com\n")
+    e = _entry(text)
+    assert scope.match("old.example.com", [e]) is None          # dentro da seção deny
+    assert scope.match("api.example.com", [e])                  # após a linha em branco
+
+
+def test_deny_cidr_wins_over_allow_cidr():
+    # negar sub-range dentro de um allow maior: o sub-range fica fora.
+    text = ("10.0.0.0/8\n"
+            "# exclude:\n"
+            "10.1.2.0/24\n")
+    e = _entry(text)
+    assert scope.match("10.9.9.9", [e])                         # allow amplo
+    assert scope.match("10.1.2.50", [e]) is None                # sub-range negado
+    assert scope.is_denied("10.1.2.50", [e])
+
+
+def test_deny_is_global_across_entries():
+    # deny num arquivo bloqueia allow de OUTRO arquivo (avaliação global).
+    allow = scope.parse_scope_text("*.example.com", Path("allow.txt"))
+    deny = scope.parse_scope_text("Fora de escopo: admin.example.com", Path("deny.txt"))
+    assert scope.match("admin.example.com", [allow, deny]) is None
+    assert scope.match("admin.example.com", [deny, allow]) is None   # ordem não importa
+    assert scope.match("api.example.com", [allow, deny])
+
+
+def test_inline_negation_does_not_leak_to_next_line():
+    # negação inline vale só pra própria linha; a seguinte continua allow.
+    text = ("bad.example.com (out of scope)\n"
+            "good.example.com\n")
+    e = _entry(text)
+    assert scope.match("bad.example.com", [e]) is None
+    assert scope.match("good.example.com", [e])
+
+
 def test_normalize_host_strips_query_and_fragment():
     e = _entry("*.example.com")
     assert scope.match("https://a.example.com?x=1", [e])        # '?' sem '/' antes

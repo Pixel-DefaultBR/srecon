@@ -89,3 +89,20 @@ def test_resource_script_is_triage_only():
 def test_load_index_missing_file(tmp_path):
     with pytest.raises(msf.MsfError):
         msf.load_index(tmp_path / "nope.json")
+
+
+def test_sanitize_rhosts_blocks_rc_injection():
+    import pytest
+    from srecon import msf
+    # host/IP/CIDR/lista válidos passam
+    assert msf.sanitize_rhosts("10.0.0.5") == "10.0.0.5"
+    assert msf.sanitize_rhosts("10.0.0.0/24 192.168.1.1") == "10.0.0.0/24 192.168.1.1"
+    assert msf.sanitize_rhosts("host.example.com") == "host.example.com"
+    # newline injetaria comandos no msfconsole -> recusa
+    with pytest.raises(ValueError):
+        msf.sanitize_rhosts("10.0.0.5\nrun")
+    with pytest.raises(ValueError):
+        msf.sanitize_rhosts("10.0.0.5; exploit")
+    # build_resource_script propaga a recusa
+    with pytest.raises(ValueError):
+        msf.build_resource_script("1.2.3.4\nset PAYLOAD x\nrun", ["exploit/x"])

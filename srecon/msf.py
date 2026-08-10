@@ -137,6 +137,21 @@ def load_index(path: Optional[Path] = None) -> MsfIndex:
 
 # ------------------------- geração de resource script ----------------------- #
 
+# RHOSTS entra num .rc lido pelo msfconsole: um '\n' (ou ';') no valor injetaria
+# comandos arbitrários no console. Só permitimos tokens de host/IP/CIDR/range e
+# separadores seguros; qualquer outra coisa é recusada (falha alto, não silencia).
+_RHOSTS_SAFE_RE = re.compile(r"^[A-Za-z0-9 ._:/-]+$")
+
+
+def sanitize_rhosts(rhosts: str) -> str:
+    """Valida RHOSTS p/ o resource script. Aceita hosts/IPs/CIDRs separados por
+    espaço/vírgula; rejeita newline e metacaracteres de comando do msfconsole."""
+    val = (rhosts or "").strip()
+    if not val or "\n" in val or "\r" in val or not _RHOSTS_SAFE_RE.match(val):
+        raise ValueError(f"RHOSTS inválido/perigoso para resource script: {rhosts!r}")
+    return val
+
+
 def _rc_use_block(fullname: str, rhosts: str, rport: Optional[int]) -> list[str]:
     lines = [f"use {fullname}", f"setg RHOSTS {rhosts}"]
     if rport:
@@ -150,6 +165,7 @@ def build_resource_script(rhosts: str, modules: list[str],
                           rport: Optional[int] = None) -> str:
     """Gera um .rc de TRIAGEM: carrega os módulos com RHOSTS/RPORT e dá 'info'.
     Deliberadamente NÃO inclui 'run'/'exploit' — disparar é ação manual do operador."""
+    rhosts = sanitize_rhosts(rhosts)   # barra injeção de comando via newline no .rc
     header = [
         "# srecon -> metasploit resource script (TRIAGEM)",
         "# Revise cada modulo. NAO ha 'run'/'exploit' aqui: rodar e decisao sua.",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -17,8 +18,64 @@ from .. import scope as scopemod
 from ..external import StageResult, resolve_bin, run_stage
 from ..util import utc_stamp
 
-FIELD_SCOPES = ("rdn", "fqdn", "dn")
+# 'auto' = deriva um regex host-anchored do escopo autorizado (default seguro:
+# o katana só rasteja hosts que o escopo cobre, em vez de 'rdn' que segue irmãos
+# do root-domain fora de escopo). rdn/fqdn/dn continuam disponíveis como override.
+FIELD_SCOPES = ("auto", "rdn", "fqdn", "dn")
 MAX_SCAN_BYTES = 3_000_000  # teto p/ varredura de forms/segredos por body inline
+
+
+# ------------------------- escopo -> regex do katana ------------------------ #
+# O katana aceita regex custom em -fs/-cs/-cos (o help mostra
+# -fs '(company-staging.io|company.com)'). Derivamos esse regex do escopo real p/
+# que o crawl NUNCA saia da superfície autorizada — mesmo seguindo links in-page.
+
+def _host_regex(domains) -> str:
+    """Regex que casa host==d OU *.d p/ cada domínio (espelha scope._domain_matches).
+    Ex.: {'example.com'} -> '(?:^|\\.)(?:example\\.com)$' (casa a.example.com, não evilexample.com)."""
+    doms = sorted({d for d in (domains or ()) if d})
+    if not doms:
+        return ""
+    alt = "|".join(re.escape(d) for d in doms)
+    return rf"(?:^|\.)(?:{alt})$"
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def derive_field_scope(host: str, hit) -> str:
+    """Regex de -fs derivado do escopo. IP -> host exato; domínio -> domínios do
+    entry autorizador (ou o próprio host, se override sem hit)."""
+    if host and _is_ip(host):
+        return rf"^{re.escape(host)}$"
+    if hit is not None and getattr(hit, "domains", None):
+        rx = _host_regex(hit.domains)
+        if rx:
+            return rx
+    # sem hit (override --i-am-authorized) ou entry só de IP: trava no host alvo
+    return rf"(?:^|\.){re.escape(host)}$" if host else "fqdn"
+
+
+def derive_out_scope(entries) -> str:
+    """Regex de -cos (exclusão) a partir dos deny_domains/deny_ips de TODOS os entries.
+    Defesa extra: mesmo que o -fs deixasse passar, o katana exclui o host negado."""
+    domains: set = set()
+    ips: set = set()
+    for e in entries or ():
+        domains |= getattr(e, "deny_domains", set()) or set()
+        ips |= getattr(e, "deny_ips", set()) or set()
+    parts = []
+    rx = _host_regex(domains)
+    if rx:
+        parts.append(rx)
+    for ip in sorted(ips):
+        parts.append(rf"^{re.escape(ip)}$")
+    return "|".join(parts)
 
 
 # ------------------------------ alvo / seeds -------------------------------- #
@@ -122,7 +179,9 @@ class CrawlOptions:
     retry: int = 2
     delay: int = 1
     duration: str = "30m"
-    field_scope: str = "rdn"
+    field_scope: str = "rdn"        # pode ser keyword (rdn/fqdn/dn) OU regex derivado
+    crawl_out_scope: str = ""       # regex -cos derivado do deny (vazio = sem -cos)
+    disable_redirects: bool = True  # -dr: NÃO segue redirect p/ host fora de escopo
     js: bool = True
     known_files: bool = True
     headless: bool = False
@@ -151,6 +210,12 @@ def build_katana_args(katana_bin: str, seeds: str, run_dir: Path, opt: CrawlOpti
         "-o", str(run_dir / "output.jsonl"),
         "-ncb", "-duc", "-silent", "-nc",
     ]
+    if opt.disable_redirects:
+        # sem -dr o katana SEGUE redirect -> GET real num host fora de escopo que
+        # nem aparece no external-hosts.txt. Default: não seguir.
+        args += ["-dr"]
+    if opt.crawl_out_scope:
+        args += ["-cos", opt.crawl_out_scope]
     if opt.store_responses:
         args += ["-store-response", "-srd", str(run_dir / "responses")]
     if opt.js:
