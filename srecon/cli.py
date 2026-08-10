@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.markup import escape
 
 from . import __version__
+from . import archive as archive_mod
 from . import config, report
 from . import cvedb
 from . import msf as msfmod
@@ -184,6 +185,15 @@ EXAMPLES = {
         "[dim]# testa autorização offline (sem API)[/dim]\n"
         "  srecon scope-check cortex.example.com\n"
         "  srecon scope-check 10.0.0.5 --scope-file scope/cliente.txt"
+    ),
+    "urls": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# URLs históricas (Wayback + gau) + inventário de params — PASSIVO[/dim]\n"
+        "  srecon urls example.com\n"
+        "[dim]# só o host (sem subdomínios), limitando o volume da Wayback[/dim]\n"
+        "  srecon urls app.example.com --no-subs --limit 5000\n"
+        "[dim]# a wordlist de params (params.txt) alimenta fuzzing dirigido[/dim]\n"
+        "  srecon urls example.com && ffuf -w reports/urls-*/params.txt ..."
     ),
     "auto": (
         "[bold cyan]Exemplos[/bold cyan]\n"
@@ -493,7 +503,7 @@ def crawl(
     retry: int = typer.Option(2, "--retry", help="retries por request."),
     delay: int = typer.Option(1, "--delay", help="delay entre requests (s, -rd)."),
     duration: str = typer.Option("30m", "--duration", help="duração máx do crawl (-ct), ex 30m/1h."),
-    field_scope: str = typer.Option("rdn", "--field-scope", help="escopo de campo do katana: rdn|fqdn|dn (-fs)."),
+    field_scope: str = typer.Option("auto", "--field-scope", help="escopo do katana: auto|rdn|fqdn|dn (-fs). 'auto' deriva regex do escopo autorizado (não vaza p/ irmãos fora de escopo)."),
     js: bool = typer.Option(True, "--js/--no-js", help="parsing de endpoints em JS (-jc)."),
     known_files: bool = typer.Option(True, "--known-files/--no-known-files", help="known-files (-kf all)."),
     headless: bool = typer.Option(False, "--headless", help="crawl headless (-hl -nos -sc -xhr); lento."),
@@ -501,6 +511,7 @@ def crawl(
     proxy: Optional[str] = typer.Option(None, "--proxy", help="proxy HTTP/SOCKS5 (-proxy)."),
     extra: Optional[str] = typer.Option(None, "--extra", help="args katana crus (word-split)."),
     store_responses: bool = typer.Option(True, "--store-responses/--no-store-responses", help="salvar respostas brutas."),
+    follow_redirects: bool = typer.Option(False, "--follow-redirects/--no-follow-redirects", help="deixar o katana seguir redirects (default NÃO: -dr, evita GET real em host fora de escopo)."),
     scope_file: Optional[Path] = typer.Option(None, help="Arquivo de escopo específico."),
     i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gating."),
     do_diff: bool = typer.Option(True, "--diff/--no-diff", help="diff vs run anterior (latest)."),
@@ -514,7 +525,7 @@ def crawl(
 ):
     """Crawl ATIVO com katana: URLs/JS/params/subs + forms/segredos/API, diff vs run anterior e encadeamento (gated por scope)."""
     if field_scope not in crawl_cmd.FIELD_SCOPES:
-        _die(f"--field-scope inválido '{field_scope}' (use rdn|fqdn|dn).")
+        _die(f"--field-scope inválido '{field_scope}' (use auto|rdn|fqdn|dn).")
     if "," in target:
         # -u do katana é lista separada por vírgula: um target com ',' viraria
         # múltiplos seeds, dos quais só o 1º passa pelo scope-gate. Recusa.
@@ -544,10 +555,15 @@ def crawl(
     if not katana:
         _die("katana não encontrado (PATH nem ~/go/bin). Instale ou ajuste o PATH.", code=127)
 
+    # 'auto' -> regex host-anchored derivado do escopo autorizado; senão keyword crua.
+    resolved_fs = crawl_cmd.derive_field_scope(host, hit) if field_scope == "auto" else field_scope
+    out_scope = crawl_cmd.derive_out_scope(entries)   # -cos a partir do deny (pode ser vazio)
+
     opt = crawl_cmd.CrawlOptions(
         depth=depth, rate=rate, host_rate=host_rate, concurrency=concurrency,
         parallelism=parallelism, timeout=timeout_s, retry=retry, delay=delay,
-        duration=duration, field_scope=field_scope, js=js, known_files=known_files,
+        duration=duration, field_scope=resolved_fs, crawl_out_scope=out_scope,
+        disable_redirects=not follow_redirects, js=js, known_files=known_files,
         headless=headless, headers=header or [], proxy=proxy or "",
         extra=crawl_cmd.split_extra(extra), store_responses=store_responses,
     )
@@ -665,6 +681,69 @@ def subs(
         report.write_subs_files(result, outdir)
         console.print(f"[dim]salvo em {outdir}[/dim]  "
                       f"[dim](alimente o pipeline: srecon pipeline --from-subs {escape(result.domain)})[/dim]")
+
+
+# --------------------------------- urls ------------------------------------ #
+
+@app.command(epilog=EXAMPLES["urls"])
+def urls(
+    domain: str = typer.Argument(..., help="Domínio/host raiz (ex: example.com)."),
+    subs: bool = typer.Option(True, "--subs/--no-subs", help="Inclui subdomínios (matchType=domain) vs. só o host."),
+    wayback: bool = typer.Option(True, "--wayback/--no-wayback", help="Fonte Wayback Machine (CDX)."),
+    gau: bool = typer.Option(True, "--gau/--no-gau", help="Fonte gau, se instalado."),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Teto de URLs da Wayback (0/omitido = sem teto)."),
+    status_ok: bool = typer.Option(False, "--status-ok", help="Só URLs com HTTP 200 no arquivo (Wayback)."),
+    wayback_timeout: float = typer.Option(30.0, help="Timeout da Wayback (s)."),
+    gau_timeout: int = typer.Option(180, help="Timeout do gau (s)."),
+    scope_file: Optional[Path] = typer.Option(None, help="Escopo específico p/ anotar in/out."),
+    save: bool = typer.Option(True, help="Salva urls-*.txt/params.txt/urls.md em reports/."),
+    as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru."),
+):
+    """Recon histórico PASSIVO (Wayback + gau): URLs conhecidas + inventário de params. Anota in/out de escopo, não bloqueia."""
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+
+    if not wayback and not gau:
+        _die("nada a fazer: --no-wayback e --no-gau desligam todas as fontes.", code=2)
+
+    try:
+        result = archive_mod.collect(
+            domain, entries, use_wayback=wayback, use_gau=gau, include_subs=subs,
+            limit=limit, status_ok_only=status_ok, wayback_timeout=wayback_timeout,
+            gau_timeout=gau_timeout,
+        )
+    except ValueError as e:
+        _die(str(e), code=2)
+
+    if not result.urls and result.errors:
+        _die("; ".join(f"{s}: {m}" for s, m in result.errors))
+
+    if as_json:
+        payload = {
+            "domain": result.domain, "sources": result.sources,
+            "counts": {"urls": len(result.urls), "in_scope": len(result.in_scope),
+                       "out_scope": len(result.out_scope), "with_params": len(result.with_params),
+                       "api": len(result.api), "interesting": len(result.interesting),
+                       "params": len(result.params)},
+            "params": {n: {"count": s.count, "example": s.example}
+                       for n, s in result.params.items()},
+            "in_scope": result.in_scope, "api": result.api, "interesting": result.interesting,
+            "errors": [{"source": s, "msg": m} for s, m in result.errors],
+        }
+        console.print_json(report.json.dumps(payload))
+    else:
+        report.print_urls(result)
+
+    if save and result.urls:
+        outdir = output_dir(config.reports_dir(), f"urls-{result.domain}")
+        report.write_urls_files(result, outdir)
+        console.print(f"[dim]salvo em {outdir}[/dim]  "
+                      f"[dim](in-scope.txt alimenta: srecon pipeline --from-file in-scope.txt)[/dim]")
 
 
 # --------------------------------- cve ------------------------------------- #
@@ -963,6 +1042,11 @@ def scope_check(
     hit = scopemod.match(target, entries)
     if hit:
         console.print(f"[green]AUTORIZADO[/green] — {escape(target)} coberto por {escape(str(hit.source))}")
+    elif scopemod.is_denied(target, entries):
+        # negado explicitamente por regra de exclusão — pior que 'não listado':
+        # em BB significa 'proibido', ainda que um allow wildcard/CIDR o cubra.
+        err.print(f"[red]NEGADO[/red] — {escape(target)} bate em regra de EXCLUSÃO (fora de escopo por decisão explícita).")
+        raise typer.Exit(code=3)
     else:
         srcs = ", ".join(str(e.source.name) for e in entries) or "(nenhum scope carregado)"
         err.print(f"[red]FORA DE ESCOPO[/red] — {escape(target)} não bate em: {escape(srcs)}")
@@ -1019,6 +1103,16 @@ def selftest():
     checks.append(("scope allow line", scopemod.match("prod.ok.com", [neg]) is not None, ""))
     checks.append(("scope negation blocks",
                    scopemod.match("bad.evil.com", [neg]) is None, "gate anti-bypass (exclusão)"))
+
+    # furo HIGH #1: deny prevalece sobre allow wildcard, e is_denied reporta certo
+    denywc = scopemod.parse_scope_text(
+        "*.example.com\n# Out of scope:\nadmin.example.com", Path("dw.txt"))
+    checks.append(("scope deny over wildcard",
+                   scopemod.match("admin.example.com", [denywc]) is None, "deny > allow wildcard"))
+    checks.append(("scope wildcard still allows",
+                   scopemod.match("api.example.com", [denywc]) is not None, ""))
+    checks.append(("scope is_denied flags exclusion",
+                   scopemod.is_denied("admin.example.com", [denywc]) is True, ""))
 
     # mineração de JS (APIs escondidas + params)
     from . import enrich

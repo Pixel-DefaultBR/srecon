@@ -206,6 +206,63 @@ def write_subs_files(result, outdir: Path) -> None:
     (outdir / "subs.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ---------------------------------- urls ------------------------------------ #
+
+def print_urls(result) -> None:
+    srcs = ", ".join(f"{k}:{v}" for k, v in result.sources.items()) or "(nenhuma fonte)"
+    console.print(
+        f"[bold]{len(result.urls)}[/bold] URL(s) únicas — "
+        f"[cyan]{len(result.in_scope)}[/cyan] em escopo, "
+        f"[yellow]{len(result.out_scope)}[/yellow] fora  "
+        f"[dim](fontes: {escape(srcs)})[/dim]"
+    )
+    console.print(
+        f"[green]{len(result.params)}[/green] parâmetro(s) distintos, "
+        f"[green]{len(result.with_params)}[/green] URL(s) com query, "
+        f"[green]{len(result.api)}[/green] com cara de API, "
+        f"[red]{len(result.interesting)}[/red] interessante(s)"
+    )
+    for src, msg in result.errors:
+        console.print(f"[yellow]{_s(src)}: {_s(msg)}[/yellow]")
+    top = sorted(result.params.values(), key=lambda p: (-p.count, p.name))[:25]
+    if top:
+        t = Table(box=box.MINIMAL_DOUBLE_HEAD, title="parâmetros mais vistos")
+        t.add_column("param")
+        t.add_column("#", justify="right")
+        t.add_column("exemplo", overflow="fold")
+        for p in top:
+            t.add_row(_s(p.name), str(p.count), _s(p.example))
+        console.print(t)
+        if len(result.params) > 25:
+            console.print(f"[dim]… (+{len(result.params) - 25}) — ver params.txt[/dim]")
+
+
+def write_urls_files(result, outdir: Path) -> None:
+    def _w(name, items):
+        (outdir / name).write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
+    _w("urls-all.txt", result.urls)
+    _w("in-scope.txt", result.in_scope)
+    _w("out-scope.txt", result.out_scope)
+    _w("with-params.txt", result.with_params)
+    _w("api.txt", result.api)
+    _w("interesting.txt", result.interesting)
+    # wordlist de params reais do alvo — alimenta Arjun/ffuf e a classificação (Fase C)
+    _w("params.txt", result.param_names)
+
+    lines = [f"# URLs históricas — {result.domain}", "",
+             f"- **total únicas:** {len(result.urls)}",
+             f"- **em escopo:** {len(result.in_scope)}",
+             f"- **fora de escopo:** {len(result.out_scope)}",
+             f"- **com parâmetros:** {len(result.with_params)}",
+             f"- **API:** {len(result.api)}",
+             f"- **interessantes:** {len(result.interesting)}",
+             f"- **params distintos:** {len(result.params)}", "",
+             "## Parâmetros mais vistos", "", "| param | # | exemplo |", "|---|---|---|"]
+    for p in sorted(result.params.values(), key=lambda p: (-p.count, p.name))[:50]:
+        lines.append(f"| {_md_cell(p.name)} | {p.count} | {_md_cell(p.example)} |")
+    (outdir / "urls.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_cve_details(details, errors) -> None:
     for d in details:
         flags = []
