@@ -334,6 +334,60 @@ def write_assets_files(result, outdir: Path) -> None:
     (outdir / "assets.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ------------------------------- candidates --------------------------------- #
+
+_SEV_STYLE = {"critical": "red", "high": "red", "medium": "yellow", "low": "dim"}
+
+
+def print_candidates(cands, active: bool = False) -> None:
+    if not cands:
+        console.print("[dim]nenhum candidato acima do limiar de confiança.[/dim]")
+        return
+    verified = [c for c in cands if c.evidence.get("verified")]
+    console.print(
+        f"[bold]{len(cands)}[/bold] candidato(s) de bug — "
+        + (f"[green]{len(verified)}[/green] confirmado(s) por prova ativa"
+           if active else "[dim]passivo (rode --active p/ provar)[/dim]")
+    )
+    t = Table(box=box.MINIMAL_DOUBLE_HEAD)
+    t.add_column("classe")
+    t.add_column("sev")
+    t.add_column("param/host")
+    t.add_column("conf", justify="right")
+    if active:
+        t.add_column("prova")
+    t.add_column("exemplo", overflow="fold")
+    for c in cands[:80]:
+        sev = f"[{_SEV_STYLE.get(c.severity, 'white')}]{c.severity}[/]"
+        row = [_s(c.vuln_class), sev, _s(c.param), str(c.confidence)]
+        if active:
+            v = c.evidence.get("verified")
+            row.append("[green]✔[/green]" if v else ("[dim]—[/dim]" if v is False else ""))
+        row.append(_s(c.example))
+        t.add_row(*row)
+    console.print(t)
+    if len(cands) > 80:
+        console.print(f"[dim]… (+{len(cands) - 80}) — ver candidates.md[/dim]")
+
+
+def write_candidates_files(cands, outdir: Path) -> None:
+    payload = [{"class": c.vuln_class, "severity": c.severity, "param": c.param,
+                "confidence": c.confidence, "example": c.example, "reason": c.reason,
+                "evidence": c.evidence} for c in cands]
+    (outdir / "candidates.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    lines = ["# Candidatos de bug (rankeados)", "",
+             f"- **total:** {len(cands)}", "",
+             "| classe | sev | param/host | conf | verif | exemplo | por quê |",
+             "|---|---|---|---|---|---|---|"]
+    for c in cands:
+        v = c.evidence.get("verified")
+        vtxt = "sim" if v else ("não" if v is False else "-")
+        lines.append(f"| {_md_cell(c.vuln_class)} | {c.severity} | {_md_cell(c.param)} | "
+                     f"{c.confidence} | {vtxt} | {_md_cell(c.example)} | {_md_cell(c.reason)} |")
+    (outdir / "candidates.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_cve_details(details, errors) -> None:
     for d in details:
         flags = []

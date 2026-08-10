@@ -14,6 +14,7 @@ from rich.markup import escape
 from . import __version__
 from . import archive as archive_mod
 from . import assets as assets_mod
+from . import candidates as cand_mod
 from . import config, report
 from . import cvedb
 from . import msf as msfmod
@@ -204,6 +205,17 @@ EXAMPLES = {
         "  srecon assets example.com --shodan\n"
         "[dim]# pivot Shodan puro-passivo com hash já conhecido (não baixa favicon)[/dim]\n"
         "  srecon assets example.com --shodan --favicon-hash -1234567890"
+    ),
+    "candidates": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# classifica candidatos de bug a partir do último 'srecon urls' — PASSIVO[/dim]\n"
+        "  srecon urls example.com && srecon candidates example.com\n"
+        "[dim]# de um arquivo de URLs qualquer[/dim]\n"
+        "  srecon candidates --from-file reports/urls-example.com/latest/urls-all.txt\n"
+        "[dim]# PROVA ativa (payload benigno) só nos hosts em escopo[/dim]\n"
+        "  srecon candidates example.com --active\n"
+        "[dim]# subdomain takeover a partir de hosts (CNAME->fingerprint)[/dim]\n"
+        "  srecon candidates example.com --takeover-hosts reports/subs-example.com/latest/in-scope.txt --active"
     ),
     "auto": (
         "[bold cyan]Exemplos[/bold cyan]\n"
@@ -839,6 +851,143 @@ def assets(
         report.write_assets_files(result, outdir)
         console.print(f"[dim]salvo em {outdir}[/dim]  "
                       f"[dim](in-scope.txt alimenta: srecon subs / pipeline --from-file)[/dim]")
+
+
+# ------------------------------ candidates --------------------------------- #
+
+def _latest_report_dir(base: Path, target: str) -> Optional[Path]:
+    """Diretório de run mais recente em reports/<slug>/ (usa 'latest' se houver)."""
+    parent = base / slugify(target)
+    latest = parent / "latest"
+    if latest.is_dir():
+        return latest
+    if not parent.is_dir():
+        return None
+    subs = sorted(d for d in parent.iterdir() if d.is_dir() and d.name != "latest")
+    return subs[-1] if subs else None
+
+
+def _load_url_lines(path: Path) -> list[str]:
+    try:
+        return [ln.strip() for ln in path.read_text(errors="ignore").splitlines() if ln.strip()]
+    except OSError:
+        return []
+
+
+@app.command(epilog=EXAMPLES["candidates"])
+def candidates(
+    domain: Optional[str] = typer.Argument(None, help="Domínio: usa o último 'srecon urls <domínio>'."),
+    from_file: Optional[Path] = typer.Option(None, "--from-file", help="Arquivo de URLs (uma por linha) em vez do último run."),
+    takeover_hosts: Optional[Path] = typer.Option(None, "--takeover-hosts", help="Arquivo de hosts p/ checar subdomain takeover (CNAME->fingerprint)."),
+    min_confidence: int = typer.Option(40, "--min-confidence", help="Confiança mínima p/ listar um candidato (0-100)."),
+    active: bool = typer.Option(False, "--active", help="PROVA ativa (payload benigno) — só hosts em escopo, gated."),
+    timeout: int = typer.Option(12, help="Timeout por sonda ativa (s)."),
+    scope_file: Optional[Path] = typer.Option(None, help="Escopo específico."),
+    i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE do scope-gate na prova ativa."),
+    save: bool = typer.Option(True, help="Salva candidates.json/.md em reports/."),
+    as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru."),
+):
+    """Hipótese de bug: classifica candidatos por param (SSRF/redirect/IDOR/XSS/LFI/SQLi) + subdomain takeover, rankeados. Passivo; --active prova em escopo."""
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+
+    # fonte de URLs
+    urls: list[str] = []
+    if from_file:
+        urls = _load_url_lines(from_file)
+        if not urls:
+            _die(f"nenhuma URL em {from_file}.", code=2)
+    elif domain:
+        rd = _latest_report_dir(config.reports_dir(), f"urls-{domain}")
+        if not rd:
+            _die(f"nenhum run de 'srecon urls {domain}' encontrado. Rode-o antes ou use --from-file.", code=2)
+        urls = _load_url_lines(rd / "urls-all.txt")
+
+    cands = cand_mod.classify_urls(urls, min_confidence=min_confidence) if urls else []
+
+    # subdomain takeover (CNAME -> fingerprint)
+    if takeover_hosts:
+        hosts = _load_url_lines(takeover_hosts)
+        cmap = cand_mod.resolve_cnames(hosts)
+        if not cmap and hosts:
+            err.print("[yellow]dnsx ausente ou sem CNAMEs — takeover pulado.[/yellow]")
+        for h, cname in cmap.items():
+            c = cand_mod.assess_takeover(h, cname)
+            if c:
+                cands.append(c)
+
+    # prova ATIVA (opt-in), só em escopo
+    if active:
+        _run_active_probes(cands, entries, i_am_authorized, timeout)
+
+    cands.sort(key=lambda c: c.sort_key())
+
+    if as_json:
+        payload = [{"class": c.vuln_class, "severity": c.severity, "param": c.param,
+                    "confidence": c.confidence, "example": c.example, "reason": c.reason,
+                    "evidence": c.evidence} for c in cands]
+        console.print_json(report.json.dumps(payload))
+    else:
+        report.print_candidates(cands, active=active)
+
+    if save and cands:
+        tgt = domain or (from_file.stem if from_file else "candidates")
+        outdir = output_dir(config.reports_dir(), f"candidates-{tgt}")
+        report.write_candidates_files(cands, outdir)
+        console.print(f"[dim]salvo em {outdir}[/dim]")
+
+
+def _run_active_probes(cands, entries, i_am_authorized: bool, timeout: int) -> None:
+    """Roda a sonda benigna adequada a cada candidato cujo host está em escopo."""
+    probed = 0
+    skipped = 0
+    for c in cands:
+        host = crawl_cmd.extract_host(c.example) or c.example
+        in_scope = scopemod.match(host, entries) is not None
+        if not in_scope and not i_am_authorized:
+            skipped += 1
+            continue
+        cls = c.vuln_class
+        if cls == "open_redirect":
+            c.evidence.update(cand_mod.probe_open_redirect(c.example, c.param, timeout))
+        elif cls == "ssrf":
+            # SSRF cego não confirma por corpo; reusa redirect como sinal de que o param
+            # controla destino (Location aponta pro canário) — indício, não prova de SSRF.
+            c.evidence.update(cand_mod.probe_open_redirect(c.example, c.param, timeout))
+        elif cls == "xss":
+            c.evidence.update(cand_mod.probe_reflection(c.example, c.param, timeout))
+        elif cls == "subdomain_takeover":
+            body = cand_mod.fetch_body(f"https://{c.example}/", timeout)
+            fp = cand_mod.match_cname_service(c.evidence.get("cname", ""))
+            if fp is not None:
+                verified = cand_mod.body_indicates_takeover(fp, body or "")
+                c.evidence["verified"] = verified
+                c.confidence = 95 if verified else 25
+        else:
+            continue
+        # endpoint-level: GraphQL introspection e CORS quando a URL tem cara de API
+        low = c.example.lower()
+        if "/graphql" in low:
+            gq = cand_mod.probe_graphql(c.example, timeout)
+            c.evidence["graphql"] = gq
+            if gq.get("verified"):
+                c.evidence["verified"] = True
+        if any(m in low for m in ("/api/", "/api?", "/graphql", "/rest/", ".json")):
+            cors = cand_mod.probe_cors(c.example, timeout)
+            c.evidence["cors"] = cors
+            if cors.get("exploitable"):
+                c.evidence["verified"] = True
+        if c.evidence.get("verified"):
+            c.confidence = max(c.confidence, 90)
+        probed += 1
+    if skipped:
+        err.print(f"[yellow]prova ativa: {skipped} candidato(s) fora de escopo pulado(s) "
+                  "(use --i-am-authorized p/ forçar).[/yellow]")
 
 
 # --------------------------------- cve ------------------------------------- #
