@@ -16,6 +16,7 @@ from . import archive as archive_mod
 from . import assets as assets_mod
 from . import candidates as cand_mod
 from . import config, report
+from . import triage as triage_mod
 from . import cvedb
 from . import msf as msfmod
 from . import scope as scopemod
@@ -216,6 +217,13 @@ EXAMPLES = {
         "  srecon candidates example.com --active\n"
         "[dim]# subdomain takeover a partir de hosts (CNAME->fingerprint)[/dim]\n"
         "  srecon candidates example.com --takeover-hosts reports/subs-example.com/latest/in-scope.txt --active"
+    ),
+    "triage": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# consolida candidates + CVEs + urls + assets num ranking único[/dim]\n"
+        "  srecon triage example.com\n"
+        "[dim]# fluxo típico: descobre -> classifica -> tria[/dim]\n"
+        "  srecon urls example.com && srecon candidates example.com && srecon triage example.com"
     ),
     "auto": (
         "[bold cyan]Exemplos[/bold cyan]\n"
@@ -988,6 +996,83 @@ def _run_active_probes(cands, entries, i_am_authorized: bool, timeout: int) -> N
     if skipped:
         err.print(f"[yellow]prova ativa: {skipped} candidato(s) fora de escopo pulado(s) "
                   "(use --i-am-authorized p/ forçar).[/yellow]")
+
+
+# -------------------------------- triage ----------------------------------- #
+
+def _read_json(path: Path):
+    try:
+        return report.json.loads(path.read_text(errors="ignore"))
+    except (OSError, ValueError):
+        return None
+
+
+@app.command(epilog=EXAMPLES["triage"])
+def triage(
+    domain: str = typer.Argument(..., help="Domínio/alvo: consolida os relatórios já gerados p/ ele."),
+    save: bool = typer.Option(True, help="Salva triage.json/.md em reports/."),
+    as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru."),
+):
+    """Triagem: consolida candidates + CVEs (host) + urls + assets num ranking único por impacto."""
+    base = config.reports_dir()
+    leads: list = []
+    used: list[str] = []
+
+    # candidatos de bug / takeover
+    cdir = _latest_report_dir(base, f"candidates-{domain}")
+    if cdir:
+        data = _read_json(cdir / "candidates.json")
+        if data is not None:
+            leads += triage_mod.leads_from_candidates(data)
+            used.append("candidates")
+
+    # CVEs do host intel (reports/<slug>/<stamp>/host.json)
+    hdir = _latest_report_dir(base, domain)
+    if hdir:
+        hj = _read_json(hdir / "host.json")
+        if hj is not None:
+            leads += triage_mod.leads_from_host(hj)
+            used.append("host")
+
+    # superfície: arquivos/endpoints interessantes do urls
+    udir = _latest_report_dir(base, f"urls-{domain}")
+    if udir:
+        interesting = _load_url_lines(udir / "interesting.txt")
+        leads += triage_mod.leads_from_urls_interesting(interesting)
+        if interesting:
+            used.append("urls")
+
+    # ativos fora de escopo (assets) — leads p/ pedir expansão de escopo
+    adir = _latest_report_dir(base, f"assets-{domain}")
+    if adir:
+        outs = _load_url_lines(adir / "out-scope.txt")
+        leads += triage_mod.leads_from_assets_outscope(outs)
+        if outs:
+            used.append("assets")
+
+    if not leads:
+        _die(f"nenhum artefato encontrado p/ '{domain}' em {base}. "
+             "Rode urls/candidates/host/assets antes.", code=2)
+
+    ranked = triage_mod.rank(leads)
+    summary = triage_mod.summarize(ranked)
+    summary["sources"] = used
+
+    if as_json:
+        payload = {"summary": summary,
+                   "leads": [{"rank": i, "category": l.category, "title": l.title,
+                              "severity": l.severity, "score": l.score,
+                              "verified": l.verified, "source": l.source, "detail": l.detail}
+                             for i, l in enumerate(ranked, 1)]}
+        console.print_json(report.json.dumps(payload))
+    else:
+        console.print(f"[dim]fontes: {', '.join(used)}[/dim]")
+        report.print_triage(ranked, summary)
+
+    if save:
+        outdir = output_dir(base, f"triage-{domain}")
+        report.write_triage_files(ranked, summary, outdir)
+        console.print(f"[dim]salvo em {outdir}[/dim]")
 
 
 # --------------------------------- cve ------------------------------------- #

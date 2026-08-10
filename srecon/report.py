@@ -388,6 +388,55 @@ def write_candidates_files(cands, outdir: Path) -> None:
     (outdir / "candidates.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def print_triage(leads, summary) -> None:
+    sev_bits = "  ".join(
+        f"[{_SEV_STYLE.get(s, 'white')}]{s}:{n}[/]"
+        for s, n in sorted(summary.get("by_severity", {}).items(),
+                           key=lambda kv: _SEV_STYLE and kv[0]))
+    console.print(f"[bold]{summary.get('total', 0)}[/bold] lead(s) consolidado(s)   {sev_bits}")
+    cats = summary.get("by_category", {})
+    if cats:
+        console.print("[dim]" + "  ".join(f"{k}:{v}" for k, v in sorted(cats.items())) + "[/dim]")
+    if not leads:
+        return
+    t = Table(box=box.MINIMAL_DOUBLE_HEAD)
+    t.add_column("#", justify="right")
+    t.add_column("cat")
+    t.add_column("sev")
+    t.add_column("score", justify="right")
+    t.add_column("V")
+    t.add_column("lead", overflow="fold")
+    t.add_column("detalhe", overflow="fold")
+    for i, l in enumerate(leads[:100], 1):
+        sev = f"[{_SEV_STYLE.get(l.severity, 'white')}]{l.severity}[/]"
+        t.add_row(str(i), _s(l.category), sev, str(l.score),
+                  "[green]✔[/green]" if l.verified else "", _s(l.title), _s(l.detail))
+    console.print(t)
+    if len(leads) > 100:
+        console.print(f"[dim]… (+{len(leads) - 100}) — ver triage.md[/dim]")
+
+
+def write_triage_files(leads, summary, outdir: Path) -> None:
+    payload = {"summary": summary,
+               "leads": [{"rank": i, "category": l.category, "title": l.title,
+                          "severity": l.severity, "score": l.score, "verified": l.verified,
+                          "source": l.source, "detail": l.detail}
+                         for i, l in enumerate(leads, 1)]}
+    (outdir / "triage.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    lines = ["# Triagem consolidada", "",
+             f"- **total:** {summary.get('total', 0)}",
+             f"- **por severidade:** {summary.get('by_severity', {})}",
+             f"- **por categoria:** {summary.get('by_category', {})}", "",
+             "| # | cat | sev | score | verif | lead | detalhe | fonte |",
+             "|---|---|---|---|---|---|---|---|"]
+    for i, l in enumerate(leads, 1):
+        lines.append(f"| {i} | {_md_cell(l.category)} | {l.severity} | {l.score} | "
+                     f"{'sim' if l.verified else '-'} | {_md_cell(l.title)} | "
+                     f"{_md_cell(l.detail)} | {_md_cell(l.source)} |")
+    (outdir / "triage.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_cve_details(details, errors) -> None:
     for d in details:
         flags = []
