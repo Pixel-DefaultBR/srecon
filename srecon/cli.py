@@ -13,6 +13,7 @@ from rich.markup import escape
 
 from . import __version__
 from . import archive as archive_mod
+from . import assets as assets_mod
 from . import config, report
 from . import cvedb
 from . import msf as msfmod
@@ -194,6 +195,15 @@ EXAMPLES = {
         "  srecon urls app.example.com --no-subs --limit 5000\n"
         "[dim]# a wordlist de params (params.txt) alimenta fuzzing dirigido[/dim]\n"
         "  srecon urls example.com && ffuf -w reports/urls-*/params.txt ..."
+    ),
+    "assets": (
+        "[bold cyan]Exemplos[/bold cyan]\n"
+        "[dim]# ativos interligados: CT (crt.sh) + ASN/netblock — GRÁTIS, passivo[/dim]\n"
+        "  srecon assets example.com\n"
+        "[dim]# + pivot por favicon no Shodan (gasta credit; alvo precisa estar em escopo)[/dim]\n"
+        "  srecon assets example.com --shodan\n"
+        "[dim]# pivot Shodan puro-passivo com hash já conhecido (não baixa favicon)[/dim]\n"
+        "  srecon assets example.com --shodan --favicon-hash -1234567890"
     ),
     "auto": (
         "[bold cyan]Exemplos[/bold cyan]\n"
@@ -744,6 +754,91 @@ def urls(
         report.write_urls_files(result, outdir)
         console.print(f"[dim]salvo em {outdir}[/dim]  "
                       f"[dim](in-scope.txt alimenta: srecon pipeline --from-file in-scope.txt)[/dim]")
+
+
+# -------------------------------- assets ----------------------------------- #
+
+@app.command(epilog=EXAMPLES["assets"])
+def assets(
+    domain: str = typer.Argument(..., help="Domínio/host raiz (ex: example.com)."),
+    ct: bool = typer.Option(True, "--ct/--no-ct", help="Certificate Transparency (crt.sh)."),
+    asn: bool = typer.Option(True, "--asn/--no-asn", help="ASN/netblock via bgpview (resolve o IP)."),
+    shodan: bool = typer.Option(False, "--shodan", help="Pivot por favicon no Shodan (OPT-IN, gasta credit)."),
+    favicon_url: Optional[str] = typer.Option(None, "--favicon-url", help="URL do favicon (default https://DOMÍNIO/favicon.ico)."),
+    favicon_hash: Optional[int] = typer.Option(None, "--favicon-hash", help="Hash mmh3 já conhecido (pivot puro-passivo, não baixa o favicon)."),
+    timeout: float = typer.Option(30.0, help="Timeout por fonte (s)."),
+    scope_file: Optional[Path] = typer.Option(None, help="Escopo específico p/ anotar in/out."),
+    i_am_authorized: bool = typer.Option(False, "--i-am-authorized", help="OVERRIDE p/ baixar favicon de host fora de escopo."),
+    save: bool = typer.Option(True, help="Salva ct-hosts.txt/in-scope.txt/assets.md em reports/."),
+    as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru."),
+):
+    """Ativos interligados ao alvo: CT (crt.sh) + ASN/netblock (grátis, passivo). --shodan pivota por favicon (opt-in). Anota in/out de escopo, não bloqueia."""
+    if scope_file:
+        try:
+            entries = [scopemod.load_scope_file(scope_file)]
+        except ValueError as e:
+            _die(str(e), code=2)
+    else:
+        entries = scopemod.load_scopes(config.scope_dir())
+
+    host = crawl_cmd.extract_host(domain) or domain
+    target_ip = None
+    if asn:
+        try:
+            target_ip = host_cmd.resolve_target_ip(host)   # DNS passivo
+        except ValueError as e:
+            err.print(f"[yellow]sem ASN: {escape(str(e))}[/yellow]")
+
+    try:
+        result = assets_mod.collect(domain, entries, target_ip=target_ip,
+                                    do_ct=ct, do_asn=asn, timeout=timeout)
+    except ValueError as e:
+        _die(str(e), code=2)
+
+    # pivot favicon->Shodan (opt-in). Baixar o favicon é ATIVO -> gate por escopo.
+    if shodan:
+        fhash = favicon_hash
+        if fhash is None:
+            in_scope = scopemod.match(host, entries) is not None
+            if not in_scope and not i_am_authorized:
+                err.print(f"[yellow]favicon não baixado: '{escape(host)}' fora de escopo. "
+                          "Use --favicon-hash N (passivo) ou --i-am-authorized.[/yellow]")
+            else:
+                furl = favicon_url or f"https://{host}/favicon.ico"
+                data = assets_mod.fetch_favicon_bytes(furl, timeout=int(timeout))
+                if not data:
+                    err.print(f"[yellow]não consegui baixar o favicon em {escape(furl)}.[/yellow]")
+                else:
+                    fhash = assets_mod.favicon_hash(data)
+        if fhash is not None:
+            try:
+                client = _client()
+                result.favicon = assets_mod.shodan_favicon_pivot(client, fhash)
+            except (ShodanClientError, ValueError) as e:
+                result.errors.append(("shodan", str(e)))
+
+    if not result.ct_hosts and not result.asn and not result.favicon and result.errors:
+        _die("; ".join(f"{s}: {m}" for s, m in result.errors))
+
+    if as_json:
+        payload = {
+            "domain": result.domain,
+            "asn": result.asn.__dict__ if result.asn else None,
+            "counts": {"ct_hosts": len(result.ct_hosts), "in_scope": len(result.in_scope),
+                       "out_scope": len(result.out_scope)},
+            "ct_hosts": result.ct_hosts, "in_scope": result.in_scope,
+            "favicon": result.favicon or None,
+            "errors": [{"source": s, "msg": m} for s, m in result.errors],
+        }
+        console.print_json(report.json.dumps(payload))
+    else:
+        report.print_assets(result)
+
+    if save and (result.ct_hosts or result.asn or result.favicon):
+        outdir = output_dir(config.reports_dir(), f"assets-{result.domain}")
+        report.write_assets_files(result, outdir)
+        console.print(f"[dim]salvo em {outdir}[/dim]  "
+                      f"[dim](in-scope.txt alimenta: srecon subs / pipeline --from-file)[/dim]")
 
 
 # --------------------------------- cve ------------------------------------- #

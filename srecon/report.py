@@ -263,6 +263,77 @@ def write_urls_files(result, outdir: Path) -> None:
     (outdir / "urls.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# --------------------------------- assets ---------------------------------- #
+
+def print_assets(result) -> None:
+    console.print(
+        f"[bold]{len(result.ct_hosts)}[/bold] host(s) via CT (crt.sh) — "
+        f"[cyan]{len(result.in_scope)}[/cyan] em escopo, "
+        f"[yellow]{len(result.out_scope)}[/yellow] fora"
+    )
+    if result.asn:
+        a = result.asn
+        console.print(
+            f"[bold]ASN[/bold] {_s('AS%s' % a.asn if a.asn else None)} "
+            f"[dim]{_s(a.org)}[/dim]  netblock [green]{_s(a.prefix)}[/green]  "
+            f"{_s(a.country)}  [dim](IP {_s(a.ip)})[/dim]"
+        )
+    if result.favicon:
+        f = result.favicon
+        line = f"[bold]favicon[/bold] hash [green]{_s(f.get('hash'))}[/green]"
+        if "shodan_count" in f:
+            line += f"  → Shodan vê [bold]{f['shodan_count']}[/bold] host(s) com o mesmo ícone"
+        if f.get("error"):
+            line += f"  [yellow]({_s(f['error'])})[/yellow]"
+        console.print(line)
+        for ip in (f.get("shodan_hosts") or [])[:20]:
+            console.print(f"  [dim]favicon-match:[/dim] {_s(ip)}")
+    for src, msg in result.errors:
+        console.print(f"[yellow]{_s(src)}: {_s(msg)}[/yellow]")
+    inset = set(result.in_scope)
+    show = result.ct_hosts[:60]
+    if show:
+        t = Table(box=box.MINIMAL_DOUBLE_HEAD, title="hosts (Certificate Transparency)")
+        t.add_column("host")
+        t.add_column("escopo")
+        for h in show:
+            t.add_row(_s(h), "[cyan]in[/cyan]" if h in inset else "[yellow]out[/yellow]")
+        console.print(t)
+        if len(result.ct_hosts) > 60:
+            console.print(f"[dim]… (+{len(result.ct_hosts) - 60}) — ver ct-hosts.txt[/dim]")
+
+
+def write_assets_files(result, outdir: Path) -> None:
+    def _w(name, items):
+        (outdir / name).write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
+    _w("ct-hosts.txt", result.ct_hosts)
+    _w("in-scope.txt", result.in_scope)
+    _w("out-scope.txt", result.out_scope)
+
+    lines = [f"# Ativos interligados — {result.domain}", "",
+             f"- **hosts CT:** {len(result.ct_hosts)}",
+             f"- **em escopo:** {len(result.in_scope)}",
+             f"- **fora de escopo:** {len(result.out_scope)}"]
+    if result.asn:
+        a = result.asn
+        lines += ["", "## ASN / netblock",
+                  f"- **ASN:** {('AS%s' % a.asn) if a.asn else '-'} ({_md_cell(a.org)})",
+                  f"- **netblock:** {_md_cell(a.prefix)}",
+                  f"- **país:** {_md_cell(a.country)}  (IP {_md_cell(a.ip)})"]
+    if result.favicon:
+        f = result.favicon
+        lines += ["", "## Favicon pivot",
+                  f"- **hash:** {_md_cell(f.get('hash'))}",
+                  f"- **Shodan count:** {f.get('shodan_count', '-')}"]
+        for ip in (f.get("shodan_hosts") or []):
+            lines.append(f"  - {_md_cell(ip)}")
+    inset = set(result.in_scope)
+    lines += ["", "## Hosts (CT)", "", "| host | escopo |", "|---|---|"]
+    for h in result.ct_hosts:
+        lines.append(f"| {_md_cell(h)} | {'in' if h in inset else 'out'} |")
+    (outdir / "assets.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_cve_details(details, errors) -> None:
     for d in details:
         flags = []
