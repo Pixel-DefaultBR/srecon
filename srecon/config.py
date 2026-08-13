@@ -21,7 +21,16 @@ class ConfigError(Exception):
 
 
 def workspace() -> Path:
-    return Path(os.environ.get("SRECON_WORKSPACE", str(DEFAULT_WORKSPACE)))
+    # 1) SRECON_WORKSPACE vence sempre (override explícito).
+    env = os.environ.get("SRECON_WORKSPACE")
+    if env and env.strip():
+        return Path(env.strip())
+    # 2) Dentro do container o bind-mount é /work — usa se existir.
+    docker_ws = Path("/work")
+    if docker_ws.is_dir():
+        return docker_ws
+    # 3) Fallback: estação de auditoria no host.
+    return DEFAULT_WORKSPACE
 
 
 def scope_dir() -> Path:
