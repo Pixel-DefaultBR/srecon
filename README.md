@@ -97,7 +97,7 @@ mas **nunca manda tráfego ativo** para o que não está autorizado:
 - **interessantes no `crawl`**: classifica a saída em `interesting.txt` (backup/VCS/config/etc.).
 
 ## Scope-gating
-- Alvo precisa bater em algum `/root/audits/scope/*.txt` (domínio, wildcard `*.x` ou CIDR).
+- Alvo precisa bater em algum `$SRECON_WORKSPACE/scope/*.txt` (domínio, wildcard `*.x` ou CIDR).
 - `--scope-file caminho.txt` usa um arquivo específico.
 - `--i-am-authorized` ignora o gate (registrado no relatório) — só com autorização escrita.
 - Hosts fora de escopo vindos de `--from-search` são **descartados**, não escaneados.
@@ -111,4 +111,4 @@ mas **nunca manda tráfego ativo** para o que não está autorizado:
 
 ## Config
 - API key: `SHODAN_API_KEY` (env) > `~/.config/srecon/config.toml` > `~/.shodan/api_key`.
-- Workspace: `SRECON_WORKSPACE` (default `/root/audits`).
+- Workspace: `SRECON_WORKSPACE` > `/work` (autodetectado no Docker) > `/root/audits`.
