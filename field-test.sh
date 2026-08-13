@@ -11,8 +11,18 @@ set -euo pipefail
 TARGET="testaspnet.vulnweb.com"
 OUT_OF_SCOPE="example.com"        # exemplo de alvo NÃO autorizado (deve ser recusado)
 
+# Resolve o workspace igual ao srecon: SRECON_WORKSPACE -> /work (Docker) -> /root/audits
+if [ -n "${SRECON_WORKSPACE:-}" ]; then
+  WS="$SRECON_WORKSPACE"
+elif [ -d /work ]; then
+  WS="/work"
+else
+  WS="/root/audits"
+fi
+mkdir -p "$WS/scope"
+
 # 0) Registrar a autorização no escopo (scan ativo exige scope/*.txt)
-cat > /root/audits/scope/vulnweb.txt <<'SCOPE'
+cat > "$WS/scope/vulnweb.txt" <<'SCOPE'
 # Acunetix "vulnweb" — alvos publicamente liberados para testar scanners.
 # Ref: http://www.vulnweb.com/
 vulnweb.com
@@ -36,7 +46,7 @@ echo "########## 3) CRAWL ATIVO (autorizado via escopo) ##########"
 srecon crawl "$TARGET" -d 2 --duration 2m
 
 echo "########## 4) RECON -> EXPLOIT (offline — não toca no alvo) ##########"
-HOSTJSON=$(ls -t /root/audits/reports/"$TARGET"/*/host.json | head -1)
+HOSTJSON=$(ls -t "$WS/reports/$TARGET"/*/host.json | head -1)
 srecon msf --report "$HOSTJSON"                 # produto/CVE -> módulos Metasploit
 srecon vulns --msf                              # rollup cross-host + módulos
 
