@@ -298,6 +298,7 @@ def host(
     as_json: bool = typer.Option(False, "--json", help="Imprime JSON cru em vez de tabela."),
 ):
     """Host & vuln intel: portas, serviços, banners e CVEs de um IP/domínio (passivo)."""
+    target = crawl_cmd.extract_host(target) or target   # aceita URL (http://ip:porta/path) -> host/IP
     client = _client()
     try:
         rep = host_cmd.run(client, target, history=history)
@@ -1566,7 +1567,7 @@ def auto(
     # assets: CT só faz sentido p/ domínio; p/ IP roda só ASN/netblock (--no-ct)
     step("assets (passivo)", assets, domain=thost, ct=not is_ip, scope_file=scope_file)
     if has_key:
-        step("host + CVEs (passivo, Shodan)", host, target=target)
+        step("host + CVEs (passivo, Shodan)", host, target=thost)
     else:
         err.print("[yellow]sem API key do Shodan — pulando host. Rode 'srecon init'.[/yellow]")
     step("vulns/msf (offline)", vulns, enrich=True, with_msf=True)

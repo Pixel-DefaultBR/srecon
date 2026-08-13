@@ -11,6 +11,8 @@ def test_extract_host_and_seeds():
     assert crawl.extract_host("https://a.example.com:8443/p?x=1") == "a.example.com"
     assert crawl.extract_host("http://user:pw@h.com/p") == "h.com"
     assert crawl.extract_host("[2001:db8::1]:443") == "2001:db8::1"
+    # regressão de campo: URL com IP:porta/path -> IP puro (não pode ir p/ DNS/report como URL)
+    assert crawl.extract_host("http://177.91.240.182:8080/v1r1/login/") == "177.91.240.182"
     assert crawl.build_seeds("example.com") == "https://example.com,http://example.com"
     assert crawl.build_seeds("https://example.com/") == "https://example.com/"
 
