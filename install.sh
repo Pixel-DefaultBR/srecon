@@ -18,7 +18,7 @@ DNSX_VERSION="${DNSX_VERSION:-v1.3.0}"
 KATANA_VERSION="${KATANA_VERSION:-v1.6.1}"
 HTTPX_VERSION="${HTTPX_VERSION:-v1.9.0}"
 NUCLEI_VERSION="${NUCLEI_VERSION:-v3.11.0}"
-TESTSSL_REF="${TESTSSL_REF:-3.2.2}"
+TESTSSL_REF="${TESTSSL_REF:-v3.2.2}"   # tags upstream têm prefixo 'v' (v3.2.2, não 3.2.2)
 TESTSSL_DIR="${TESTSSL_DIR:-$HOME/.local/share/testssl.sh}"
 
 SRECON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
