@@ -47,24 +47,33 @@ def test_parse_crtsh_json_bad_input():
     assert assets.parse_crtsh_json(json.dumps({"not": "a list"})) == set()
 
 
-def test_parse_bgpview_ip():
+def test_parse_ripestat_prefix():
     raw = json.dumps({
         "status": "ok",
-        "data": {"prefixes": [
-            {"prefix": "203.0.113.0/24",
-             "asn": {"asn": 64500, "name": "ACME", "description": "ACME Corp", "country_code": "BR"}},
-        ]},
+        "data": {
+            "resource": "203.0.113.0/24",
+            "asns": [{"asn": 64500, "holder": "AS64500 - ACME Corp"}],
+        },
     })
-    info = assets.parse_bgpview_ip(raw, "203.0.113.7")
+    info = assets.parse_ripestat_prefix(raw, "203.0.113.7")
     assert info.asn == 64500
     assert info.prefix == "203.0.113.0/24"
     assert info.org == "ACME Corp"
-    assert info.country == "BR"
+    assert info.asn_name == "ACME Corp"
 
 
-def test_parse_bgpview_ip_error_status():
-    assert assets.parse_bgpview_ip(json.dumps({"status": "error"}), "1.2.3.4") is None
-    assert assets.parse_bgpview_ip("garbage", "1.2.3.4") is None
+def test_parse_ripestat_prefix_holder_sem_separador():
+    # holder sem ' - ' cai pro texto inteiro (defensivo)
+    raw = json.dumps({"data": {"resource": "198.51.100.0/24",
+                               "asns": [{"asn": 64501, "holder": "SOLO"}]}})
+    info = assets.parse_ripestat_prefix(raw, "198.51.100.1")
+    assert info.asn == 64501
+    assert info.org == "SOLO"
+
+
+def test_parse_ripestat_prefix_erro():
+    assert assets.parse_ripestat_prefix(json.dumps({"status": "error"}), "1.2.3.4") is None
+    assert assets.parse_ripestat_prefix("garbage", "1.2.3.4") is None
 
 
 def test_partition_scope_respects_deny():

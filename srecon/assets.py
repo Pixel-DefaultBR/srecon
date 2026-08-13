@@ -1,5 +1,5 @@
 """Asset pivoting PASSIVO: descobre ativos interligados ao alvo por fontes de
-terceiros (Certificate Transparency via crt.sh + ASN/netblock via bgpview).
+terceiros (Certificate Transparency via crt.sh + ASN/netblock via RIPEstat).
 Opcionalmente pivota por favicon hash no Shodan (--shodan, gasta credit).
 
 Filosofia: fontes GRÁTIS e passivas primeiro (não tocam o alvo, não gastam
@@ -25,7 +25,7 @@ from . import scope as scopemod
 
 _UA = "srecon/assets"
 CRTSH = "https://crt.sh/"
-BGPVIEW = "https://api.bgpview.io"
+RIPESTAT = "https://stat.ripe.net/data"   # bgpview.io saiu do ar (NXDOMAIN); RIPEstat é o substituto passivo
 
 
 class AssetsError(Exception):
@@ -111,30 +111,39 @@ class AsnInfo:
     country: str = ""
 
 
-def parse_bgpview_ip(raw: bytes | str, ip: str) -> Optional[AsnInfo]:
+def parse_ripestat_prefix(raw: bytes | str, ip: str) -> Optional[AsnInfo]:
+    """Parseia RIPEstat prefix-overview: prefixo + ASN + holder numa só resposta.
+    Holder vem como 'AS263449 - THINK IT LTDA.'; separamos o número do nome."""
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    if not isinstance(data, dict) or data.get("status") != "ok":
+    if not isinstance(data, dict) or data.get("status") not in (None, "ok"):
         return None
     d = data.get("data") or {}
+    if not isinstance(d, dict):
+        return None
     info = AsnInfo(ip=ip)
-    pfx = d.get("prefixes") or []
-    if pfx and isinstance(pfx, list):
-        first = pfx[0] or {}
-        info.prefix = str(first.get("prefix") or "")
-        asn = first.get("asn") or {}
-        if isinstance(asn, dict):
-            info.asn = asn.get("asn")
-            info.asn_name = str(asn.get("name") or "")
-            info.org = str(asn.get("description") or asn.get("name") or "")
-            info.country = str(asn.get("country_code") or "")
+    info.prefix = str(d.get("resource") or "")
+    asns = d.get("asns") or []
+    if asns and isinstance(asns, list):
+        first = asns[0] or {}
+        if isinstance(first, dict):
+            try:
+                info.asn = int(first.get("asn")) if first.get("asn") is not None else None
+            except (ValueError, TypeError):
+                info.asn = None
+            holder = str(first.get("holder") or "")
+            # 'AS263449 - THINK IT LTDA.' -> nome legível após o ' - '
+            name = holder.split(" - ", 1)[1] if " - " in holder else holder
+            info.asn_name = name
+            info.org = name
     return info
 
 
 def fetch_asn(ip: str, timeout: float = 20.0) -> Optional[AsnInfo]:
-    return parse_bgpview_ip(_get(f"{BGPVIEW}/ip/{ip}", timeout=timeout), ip)
+    url = f"{RIPESTAT}/prefix-overview/data.json?resource={ip}"
+    return parse_ripestat_prefix(_get(url, timeout=timeout), ip)
 
 
 # --------------------------------- favicon ---------------------------------- #
@@ -219,7 +228,7 @@ def partition_scope(hosts, scope_entries) -> tuple[list, list]:
 def collect(domain: str, scope_entries, target_ip: Optional[str] = None,
             do_ct: bool = True, do_asn: bool = True,
             timeout: float = 30.0) -> AssetsResult:
-    """Fontes grátis/passivas: CT (crt.sh) + ASN/netblock (bgpview). Degrada por fonte.
+    """Fontes grátis/passivas: CT (crt.sh) + ASN/netblock (RIPEstat). Degrada por fonte.
     O pivot Shodan (favicon) é feito à parte pelo caller (opt-in)."""
     dom = (domain or "").strip().lower().rstrip(".")
     if not dom:
@@ -238,7 +247,7 @@ def collect(domain: str, scope_entries, target_ip: Optional[str] = None,
         try:
             res.asn = fetch_asn(target_ip, timeout=timeout)
         except AssetsError as e:
-            res.errors.append(("bgpview", str(e)))
+            res.errors.append(("ripestat", str(e)))
 
     return res
 
